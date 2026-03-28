@@ -14,7 +14,7 @@
 mod cuda_impl {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchAsync};
+    use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync};
     use tracing::{debug, info, trace};
 
     use crate::bridge::{LLMError, Result};
@@ -35,7 +35,6 @@ mod cuda_impl {
         loader: KernelLoader,
         config: ModelRunnerConfig,
         device: Arc<CudaDevice>,
-        stream: CudaStream,
         layers: Vec<GpuTransformerLayer>,
         embed_tokens: CudaSlice<f32>,
         final_norm_weight: CudaSlice<f32>,
@@ -62,10 +61,6 @@ mod cuda_impl {
                 vocab = config.vocab_size,
                 "GpuModelRunner::new"
             );
-
-            // cudarc 0.12: streams are created via fork_default_stream()
-            let stream = device.fork_default_stream()
-                .map_err(|e| LLMError::GpuError(format!("stream creation failed: {e}")))?;
 
             let embed_tokens = weights
                 .get("model.embed_tokens.weight")
@@ -125,7 +120,6 @@ mod cuda_impl {
                 loader,
                 config,
                 device,
-                stream,
                 layers,
                 embed_tokens,
                 final_norm_weight,
@@ -190,7 +184,7 @@ mod cuda_impl {
             // Metadata dump (first 5 calls)
             static CALL_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let call_num = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let probe = call_num < 25;
+            let probe = false; // disabled -- stream race fixed
             if probe {
                 eprintln!("STEP {} prefill={} toks={:?} pos={:?} slots={:?} ctx={:?} maxctx={}",
                     call_num, is_prefill, token_ids, positions,
@@ -314,19 +308,14 @@ mod cuda_impl {
                 info!(first5 = ?&h[..5.min(h.len())], "DECODE_PROBE final hidden state");
             }
 
-            // Step 3: final RMSNorm
+            // Step 3: final RMSNorm (all on stream 0, no sync needed)
             let normed = CudaRMSNorm::forward(
                 &hidden_states,
                 &self.final_norm_weight,
                 self.rms_norm_eps,
                 hidden_size,
                 &self.loader,
-                &self.stream,
             )?;
-
-            // Sync before LM head: RMSNorm runs on self.stream, cuBLAS on default stream
-            self.device.synchronize()
-                .map_err(|e| LLMError::GpuError(format!("pre-LM-head sync: {e}")))?;
 
             // Step 4: LM head  normed [num_tokens, hidden] @ lm_head^T [hidden, vocab]
             let logits_gpu = CudaLinearLayer::forward_once(

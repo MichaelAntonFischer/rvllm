@@ -144,9 +144,7 @@ mod inner {
                 hidden,
             )?;
 
-            // Sync: RMSNorm kernel on default stream, cuBLAS may use different stream
-            self.device.synchronize()
-                .map_err(|e| LLMError::GpuError(format!("post-rmsnorm sync: {e}")))?;
+            // All ops on stream 0 -- no cross-stream sync needed
 
             // ---------------------------------------------------------------
             // 2. QKV projections via cuBLAS sgemm
@@ -186,9 +184,6 @@ mod inner {
                 head_dim,
             )?;
 
-            // Sync: RoPE kernel finished, cuBLAS/attention next
-            self.device.synchronize()
-                .map_err(|e| LLMError::GpuError(format!("post-rope sync: {e}")))?;
 
             // ---------------------------------------------------------------
             // 4. KV cache write + Attention (prefill vs decode)
@@ -205,9 +200,6 @@ mod inner {
 
             info!(layer = cfg.layer_idx, "gpu_layer: cache_write done");
 
-            // Sync: cache_write kernel must finish before FA2 reads cache
-            self.device.synchronize()
-                .map_err(|e| LLMError::GpuError(format!("post-cache-write sync: {e}")))?;
 
             let attn_out = if input.is_prefill {
                 // Prefill: use naive cuBLAS attention (Q@K^T -> softmax -> @V)
@@ -232,9 +224,6 @@ mod inner {
                 )?
             };
 
-            // Sync: attention kernel must finish before cuBLAS O-projection
-            self.device.synchronize()
-                .map_err(|e| LLMError::GpuError(format!("post-attention sync: {e}")))?;
 
             // ---------------------------------------------------------------
             // 5. Output projection

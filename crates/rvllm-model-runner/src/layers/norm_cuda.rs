@@ -5,7 +5,7 @@
 //! cudarc for device memory types.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceSlice as _, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DevicePtrMut, DeviceSlice as _, LaunchAsync, LaunchConfig};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
@@ -34,7 +34,6 @@ impl CudaRMSNorm {
     /// * `eps`         - Epsilon for numerical stability (e.g. 1e-6).
     /// * `hidden_size` - The hidden dimension (last axis of input).
     /// * `loader`      - KernelLoader holding the compiled rms_norm PTX module.
-    /// * `stream`      - CUDA stream for async execution.
     ///
     /// # Returns
     /// A new `CudaSlice<f32>` of the same length as `input` containing the normalized output.
@@ -44,7 +43,6 @@ impl CudaRMSNorm {
         eps: f32,
         hidden_size: usize,
         loader: &KernelLoader,
-        stream: &CudaStream,
     ) -> Result<CudaSlice<f32>> {
         let num_elements = input.len();
         if num_elements == 0 {
@@ -90,8 +88,7 @@ impl CudaRMSNorm {
         let func = loader.get_func("rms_norm", "rms_norm_kernel")?;
         unsafe {
             func
-                .launch_on_stream(
-                    stream,
+                .launch(
                     cfg,
                     (&output, input, weight, eps, hidden_size_i32),
                 )
@@ -112,7 +109,6 @@ impl CudaRMSNorm {
         eps: f32,
         hidden_size: usize,
         loader: &KernelLoader,
-        stream: &CudaStream,
     ) -> Result<()> {
         let num_elements = input.len();
         if num_elements == 0 {
@@ -162,7 +158,7 @@ impl CudaRMSNorm {
                 &mut hs as *mut _ as *mut _,
             ];
             func
-                .launch_on_stream(stream, cfg, params)
+                .launch(cfg, params)
                 .map_err(|e| {
                     LLMError::GpuError(format!(
                         "CudaRMSNorm: inplace kernel launch failed: {e}"
