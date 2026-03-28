@@ -23,6 +23,8 @@ pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod gpu_engine;
 pub mod gpu_metrics;
+#[cfg(any(feature = "cuda", test))]
+mod hf_snapshot;
 pub mod output;
 pub mod stop_checker;
 
