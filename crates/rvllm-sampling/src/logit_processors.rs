@@ -18,21 +18,22 @@ pub fn apply_temperature(logits: &mut [f32], temperature: f32) {
 
 /// Keep only the top-k highest logits; set the rest to -inf.
 /// k=0 means no filtering.
-/// Uses O(n) quickselect instead of O(n log n) full sort.
+/// Uses O(n) quickselect on indices to find threshold without cloning logits.
 #[inline]
 pub fn apply_top_k(logits: &mut [f32], k: u32) {
     let k = k as usize;
     if k == 0 || k >= logits.len() {
         return;
     }
-    // O(n) quickselect to find the k-th largest value.
-    let mut vals: Vec<f32> = logits.to_vec();
-    vals.select_nth_unstable_by(k - 1, |a, b| {
-        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+    // Quickselect on index array to find the k-th largest value.
+    let mut indices: Vec<u32> = (0..logits.len() as u32).collect();
+    indices.select_nth_unstable_by(k - 1, |&a, &b| {
+        logits[b as usize]
+            .partial_cmp(&logits[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let threshold = vals[k - 1];
+    let threshold = logits[indices[k - 1] as usize];
 
-    // Count how many are >= threshold (handles ties).
     let count_above = logits.iter().filter(|&&v| v >= threshold).count();
 
     if count_above <= k {
@@ -42,7 +43,6 @@ pub fn apply_top_k(logits: &mut [f32], k: u32) {
             }
         }
     } else {
-        // Ties at the boundary -- keep exactly k, left-to-right.
         let mut kept = 0;
         for l in logits.iter_mut() {
             if *l > threshold {
@@ -58,6 +58,7 @@ pub fn apply_top_k(logits: &mut [f32], k: u32) {
 
 /// Nucleus (top-p) sampling filter. Sort by descending probability, accumulate
 /// until the cumulative probability exceeds p, then mask out the rest.
+/// Uses index sort to avoid allocating a separate (index, prob) vec.
 #[inline]
 pub fn apply_top_p(logits: &mut [f32], p: f32) {
     if p >= 1.0 || p <= 0.0 {
@@ -66,24 +67,28 @@ pub fn apply_top_p(logits: &mut [f32], p: f32) {
     let n = logits.len();
     let probs = crate::math::softmax(logits);
 
-    // Build (index, prob) sorted descending by prob.
-    let mut indexed: Vec<(usize, f32)> = Vec::with_capacity(n);
-    indexed.extend(probs.iter().copied().enumerate());
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort indices by descending probability.
+    let mut indices: Vec<u32> = (0..n as u32).collect();
+    indices.sort_unstable_by(|&a, &b| {
+        probs[b as usize]
+            .partial_cmp(&probs[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    let mut cumulative = 0.0;
-    let mut keep = vec![false; n];
-    for &(idx, prob) in &indexed {
-        keep[idx] = true;
-        cumulative += prob;
+    // Walk sorted indices, accumulate until we hit p.
+    let mut cumulative = 0.0f32;
+    let mut cutoff = n; // everything past this index in sorted order gets masked
+    for (rank, &idx) in indices.iter().enumerate() {
+        cumulative += probs[idx as usize];
         if cumulative >= p {
+            cutoff = rank + 1;
             break;
         }
     }
-    for (i, l) in logits.iter_mut().enumerate() {
-        if !keep[i] {
-            *l = f32::NEG_INFINITY;
-        }
+
+    // Mask out everything not in the top-p nucleus.
+    for &idx in &indices[cutoff..] {
+        logits[idx as usize] = f32::NEG_INFINITY;
     }
 }
 

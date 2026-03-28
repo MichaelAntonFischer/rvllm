@@ -71,40 +71,44 @@ impl Sampler {
             );
         }
 
-        // Greedy: skip temperature/top-k/top-p entirely.
         let is_greedy = params.temperature == 0.0;
+        let needs_logprobs = matches!(params.logprobs, Some(n) if n > 0);
 
         if !is_greedy {
-            // 3. Temperature
             logit_processors::apply_temperature(&mut work, params.temperature);
-
-            // 4. Top-k
             logit_processors::apply_top_k(&mut work, params.top_k);
-
-            // 5. Top-p
             logit_processors::apply_top_p(&mut work, params.top_p);
-
-            // 6. Min-p
             logit_processors::apply_min_p(&mut work, params.min_p);
         }
 
-        // Collect top logprobs before sampling (from original processed logits).
-        let top_lp = match params.logprobs {
-            Some(n) if n > 0 => math::top_logprobs(&work, n),
-            _ => Vec::new(),
+        // Collect top logprobs before sampling (if requested).
+        let top_lp = if needs_logprobs {
+            math::top_logprobs(&work, params.logprobs.unwrap_or(0))
+        } else {
+            Vec::new()
         };
 
-        // Sample
-        let token_id = if is_greedy {
-            math::greedy_sample(&work)
+        // Sample + compute logprob of selected token.
+        let (token_id, logprob) = if is_greedy {
+            let tid = math::greedy_sample(&work);
+            // Only compute log_softmax if logprobs requested or we need the value.
+            let lp = if needs_logprobs {
+                let log_probs = math::log_softmax(&work);
+                log_probs[tid as usize]
+            } else {
+                // Fast path: compute just this token's log-prob from max-shifted softmax.
+                let max = work.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = work.iter().map(|x| (x - max).exp()).sum();
+                (work[tid as usize] - max) - sum.ln()
+            };
+            (tid, lp)
         } else {
             let probs = math::softmax(&work);
-            math::multinomial_sample(&probs, rng)
+            let tid = math::multinomial_sample(&probs, rng);
+            // Derive logprob from already-computed probs (avoid redundant log_softmax).
+            let lp = probs[tid as usize].max(f32::MIN_POSITIVE).ln();
+            (tid, lp)
         };
-
-        // Compute log-prob of selected token.
-        let log_probs = math::log_softmax(&work);
-        let logprob = log_probs[token_id as usize];
 
         trace!(token_id, logprob, "sampled token");
 
@@ -118,7 +122,7 @@ impl Sampler {
 
 /// Build a token -> count map from a sequence of past tokens.
 fn build_token_counts(tokens: &[TokenId]) -> HashMap<TokenId, usize> {
-    let mut counts = HashMap::new();
+    let mut counts = HashMap::with_capacity(tokens.len().min(256));
     for &t in tokens {
         *counts.entry(t).or_insert(0) += 1;
     }

@@ -85,6 +85,26 @@ pub fn select_backend_with_options(
     }
 }
 
+/// Context-length-aware backend selection for decode steps.
+///
+/// For short contexts (<= 1024 tokens), FlashAttention-2 is preferred since
+/// the work fits in a single thread block. For longer contexts, SplitKV
+/// distributes across blocks for better occupancy.
+pub fn select_decode_backend(
+    compute_capability: (u32, u32),
+    max_context_len: usize,
+) -> Box<dyn AttentionBackend> {
+    let (major, _) = compute_capability;
+    if major < 8 {
+        return Box::new(PagedAttentionV2::new());
+    }
+    if max_context_len <= 1024 {
+        Box::new(FlashAttention2::new())
+    } else {
+        Box::new(SplitKvAttention::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

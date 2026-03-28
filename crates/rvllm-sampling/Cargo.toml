@@ -25,3 +25,10 @@ rayon.workspace = true
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "sampling"
+harness = false
