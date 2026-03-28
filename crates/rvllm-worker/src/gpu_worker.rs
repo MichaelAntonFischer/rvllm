@@ -603,7 +603,7 @@ impl GpuWorker {
             .map_err(|e| LLMError::GpuError(format!("kernel loader: {e}")))?;
 
             let mr_config = self.config.model_runner_config();
-            let runner = rvllm_model_runner::gpu_runner::GpuModelRunner::new(
+            let mut runner = rvllm_model_runner::gpu_runner::GpuModelRunner::new(
                 loader_weights,
                 cache,
                 runner_blas,
