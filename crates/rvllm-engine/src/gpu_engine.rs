@@ -12,7 +12,7 @@ mod inner {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
-    use tracing::{debug, info, warn};
+    use tracing::{debug, info, trace, warn};
 
     use rvllm_block_manager::prefix_cache::{self, PrefixCache};
     use rvllm_config::EngineConfig;
@@ -518,7 +518,7 @@ mod inner {
                 }
             }
 
-            info!(
+            trace!(
                 num_groups = metadata.len(),
                 "gpu_engine: calling worker.execute"
             );
@@ -526,7 +526,7 @@ mod inner {
                 .worker
                 .execute(&metadata)
                 .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
-            info!(
+            trace!(
                 num_outputs = worker_outputs.outputs.len(),
                 "gpu_engine: worker.execute returned"
             );
@@ -629,7 +629,7 @@ mod inner {
                 }
             }
 
-            info!(
+            trace!(
                 num_groups = metadata.len(),
                 "pipelined: submitting to GPU thread"
             );
@@ -643,16 +643,16 @@ mod inner {
             scheduled_groups: &[SequenceGroup],
             worker_outputs: &GpuWorkerOutput,
         ) -> Vec<RequestOutput> {
-            let mut output_map: HashMap<u64, (TokenId, LogProb, Vec<(TokenId, LogProb)>)> =
-                HashMap::new();
+            let mut output_map: HashMap<u64, (TokenId, LogProb, &[(TokenId, LogProb)])> =
+                HashMap::with_capacity(worker_outputs.outputs.len());
             for wo in &worker_outputs.outputs {
                 output_map.insert(
                     wo.seq_id,
-                    (wo.token_id, wo.logprob, wo.top_logprobs.clone()),
+                    (wo.token_id, wo.logprob, &wo.top_logprobs),
                 );
             }
 
-            let mut results = Vec::new();
+            let mut results = Vec::with_capacity(scheduled_groups.len());
             let eos = self.tokenizer.eos_token_id();
 
             for group in scheduled_groups {
@@ -665,18 +665,29 @@ mod inner {
                 let logprobs_requested =
                     req.sampling_params.logprobs.map(|n| n > 0).unwrap_or(false);
 
+                // Only decode token text when stop_strings require it;
+                // EOS and max_tokens checks only need token IDs.
+                let needs_text = !req.sampling_params.stop_strings.is_empty();
+
                 for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
                     if seq.is_finished() {
                         continue;
                     }
 
                     if let Some((token_id, logprob, top_lps)) = output_map.get(&seq.seq_id.0) {
-                        let decoded = self.tokenizer.decode(&[*token_id]).unwrap_or_default();
+                        // Defer tokenizer.decode() when no stop_strings are configured.
+                        // For greedy decode the token ID is sufficient for the scheduler;
+                        // full text is reconstructed when the response is sent to the client.
+                        let decoded = if needs_text {
+                            self.tokenizer.decode(&[*token_id]).unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
                         self.scheduler
                             .update_seq_token(seq.seq_id, *token_id, *logprob);
 
                         let top_logprobs = if logprobs_requested && !top_lps.is_empty() {
-                            Some(top_lps.clone())
+                            Some(top_lps.to_vec())
                         } else {
                             None
                         };
@@ -698,6 +709,23 @@ mod inner {
                                     FinishReason::Abort => SequenceStatus::FinishedAborted,
                                 };
                                 self.scheduler.finish_seq(seq.seq_id, status);
+                            }
+                        }
+                    }
+                }
+
+                // Lazy text reconstruction: when decode was deferred (no stop_strings),
+                // batch-decode accumulated token_ids into text for finished sequences
+                // or for any output that will be returned to the client.
+                if !needs_text {
+                    let all_finished = req.seq_states.iter().all(|s| s.is_finished());
+                    if all_finished {
+                        for state in &mut req.seq_states {
+                            if !state.token_ids.is_empty() && state.text.is_empty() {
+                                state.text = self
+                                    .tokenizer
+                                    .decode(&state.token_ids)
+                                    .unwrap_or_default();
                             }
                         }
                     }

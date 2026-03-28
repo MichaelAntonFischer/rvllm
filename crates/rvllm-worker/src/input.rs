@@ -64,7 +64,7 @@ fn prepare_prefill(metadata: &[SequenceGroupMetadata], block_size: usize) -> Res
             let seq_len = prompt_tokens.len();
 
             token_ids.extend_from_slice(prompt_tokens);
-            position_ids.extend((0..seq_len as u32).collect::<Vec<_>>());
+            position_ids.extend(0..seq_len as u32);
             context_lens.push(seq_len as u32);
 
             // Build slot mapping from block table
@@ -180,7 +180,7 @@ fn prepare_prefill_refs(
             let seq_len = prompt_tokens.len();
 
             token_ids.extend_from_slice(prompt_tokens);
-            position_ids.extend((0..seq_len as u32).collect::<Vec<_>>());
+            position_ids.extend(0..seq_len as u32);
             context_lens.push(seq_len as u32);
 
             let bt = group
@@ -314,6 +314,122 @@ fn merge_inputs(prefill: ModelInput, decode: ModelInput) -> ModelInput {
         },
         is_prefill: true,
     }
+}
+
+/// Reusable scratch buffers for `prepare_decode_reuse`, avoiding per-step heap allocations.
+pub struct DecodeInputScratch {
+    pub token_ids: Vec<u32>,
+    pub position_ids: Vec<u32>,
+    pub slot_mapping: Vec<u32>,
+    pub context_lens: Vec<u32>,
+    pub block_tables: Vec<Vec<u32>>,
+    pub query_lens: Vec<u32>,
+    /// Scratch for concatenating prompt + output token ids without allocating.
+    all_tokens: Vec<TokenId>,
+}
+
+impl DecodeInputScratch {
+    pub fn new() -> Self {
+        Self {
+            token_ids: Vec::with_capacity(64),
+            position_ids: Vec::with_capacity(64),
+            slot_mapping: Vec::with_capacity(64),
+            context_lens: Vec::with_capacity(64),
+            block_tables: Vec::with_capacity(64),
+            query_lens: Vec::with_capacity(64),
+            all_tokens: Vec::with_capacity(256),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.token_ids.clear();
+        self.position_ids.clear();
+        self.slot_mapping.clear();
+        self.context_lens.clear();
+        // Reuse inner Vecs in block_tables by clearing them rather than dropping
+        for bt in &mut self.block_tables {
+            bt.clear();
+        }
+        self.query_lens.clear();
+    }
+}
+
+impl Default for DecodeInputScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Like `prepare_decode` but reuses caller-owned scratch buffers to avoid heap allocations.
+pub fn prepare_decode_reuse(
+    scratch: &mut DecodeInputScratch,
+    metadata: &[SequenceGroupMetadata],
+    block_size: usize,
+) -> Result<ModelInput> {
+    scratch.clear();
+
+    // Count sequences for block_tables reuse
+    let mut seq_idx = 0usize;
+
+    for group in metadata {
+        for (seq_id, seq_data) in &group.seq_data {
+            // Build all token ids in scratch buffer
+            scratch.all_tokens.clear();
+            scratch.all_tokens.extend_from_slice(&seq_data.prompt_token_ids);
+            scratch.all_tokens.extend_from_slice(&seq_data.output_token_ids);
+
+            let last_token = scratch.all_tokens.last().copied().unwrap_or(0);
+            scratch.token_ids.push(last_token);
+
+            let seq_len = scratch.all_tokens.len();
+            scratch.position_ids.push((seq_len - 1) as u32);
+            scratch.context_lens.push(seq_len as u32);
+
+            let bt = group
+                .block_tables
+                .get(seq_id)
+                .map(|t| t.as_slice())
+                .unwrap_or(&[]);
+
+            let block_idx = (seq_len - 1) / block_size;
+            let block_offset = (seq_len - 1) % block_size;
+            if block_idx < bt.len() {
+                let physical_block = bt[block_idx].0;
+                scratch.slot_mapping.push(physical_block * block_size as u32 + block_offset as u32);
+            } else {
+                scratch.slot_mapping.push(0);
+            }
+
+            // Reuse existing inner Vec if available, otherwise push a new one
+            if seq_idx < scratch.block_tables.len() {
+                scratch.block_tables[seq_idx].extend(bt.iter().map(|b| b.0));
+            } else {
+                scratch.block_tables.push(bt.iter().map(|b| b.0).collect());
+            }
+            seq_idx += 1;
+        }
+    }
+
+    // Truncate block_tables to actual sequence count (extras already cleared)
+    scratch.block_tables.truncate(seq_idx);
+
+    let num_seqs = scratch.context_lens.len();
+    scratch.query_lens.resize(num_seqs, 1);
+
+    let max_context_len = scratch.context_lens.iter().copied().max().unwrap_or(0);
+
+    Ok(ModelInput {
+        token_ids: scratch.token_ids.clone(),
+        position_ids: scratch.position_ids.clone(),
+        attention_metadata: AttentionMetadata {
+            slot_mapping: scratch.slot_mapping.clone(),
+            query_lens: scratch.query_lens.clone(),
+            context_lens: scratch.context_lens.clone(),
+            block_tables: scratch.block_tables.clone(),
+            max_context_len,
+        },
+        is_prefill: false,
+    })
 }
 
 /// Helper: get all token IDs (prompt + output) from SequenceData.

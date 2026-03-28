@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 
@@ -766,19 +766,19 @@ impl GpuWorker {
         let greedy_only = Self::all_greedy(metadata);
 
         // Run real GPU forward pass with RoPE and KV cache
-        info!(greedy_only, "gpu_worker: entering gpu_forward");
+        trace!(greedy_only, "gpu_worker: entering gpu_forward");
         let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
 
         let outputs = match fwd_output {
             ForwardOutput::TokenIds(ref token_ids) => {
-                info!(
+                trace!(
                     num_ids = token_ids.len(),
                     "gpu_worker: gpu argmax fast path"
                 );
                 self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
             }
             ForwardOutput::Logits(ref logits) => {
-                info!(
+                trace!(
                     logits_len = logits.len(),
                     "gpu_worker: full logits path"
                 );
@@ -982,32 +982,38 @@ impl GpuWorker {
             )?;
 
             // Begin capture on the model runner's stream.
-            self.graph_runner.pool_mut().begin_capture_on(&cuda_stream)?;
-            let result = runner.forward_gpu_only(
-                num_tokens, num_seqs, max_context_len, false,
-            );
+            let capture_begin = self.graph_runner.pool_mut().begin_capture_on(&cuda_stream);
+            if let Err(e) = capture_begin {
+                warn!("graph capture begin failed: {e} -- skipping capture for batch {padded_batch}");
+                self.graph_runner.mark_captured(padded_batch);
+                // Fall through to normal path below
+            } else {
+                let result = runner.forward_gpu_only(
+                    num_tokens, num_seqs, max_context_len, false,
+                );
 
-            match result {
-                Ok(()) => {
-                    let graph = self.graph_runner.pool_mut().end_capture_on(
-                        &cuda_stream, padded_batch,
-                    )?;
-                    self.graph_runner.pool_mut().insert(graph);
-                    self.graph_runner.mark_captured(padded_batch);
-                    info!(padded_batch, "CUDA graph captured successfully");
+                match result {
+                    Ok(()) => {
+                        let graph = self.graph_runner.pool_mut().end_capture_on(
+                            &cuda_stream, padded_batch,
+                        )?;
+                        self.graph_runner.pool_mut().insert(graph);
+                        self.graph_runner.mark_captured(padded_batch);
+                        info!(padded_batch, "CUDA graph captured successfully");
 
-                    // DtoH read from persistent output buffer.
-                    let ids = runner.read_graph_output(num_tokens)?;
-                    let trimmed: Vec<i32> = ids[..actual_batch].to_vec();
-                    return Ok(ForwardOutput::TokenIds(trimmed));
-                }
-                Err(e) => {
-                    warn!("graph capture forward failed, falling back: {e}");
-                    let _ = self.graph_runner.pool_mut().end_capture_on(
-                        &cuda_stream, padded_batch,
-                    );
-                    self.graph_runner.mark_captured(padded_batch);
-                    // Fall through to normal path below
+                        // DtoH read from persistent output buffer.
+                        let ids = runner.read_graph_output(num_tokens)?;
+                        let trimmed: Vec<i32> = ids[..actual_batch].to_vec();
+                        return Ok(ForwardOutput::TokenIds(trimmed));
+                    }
+                    Err(e) => {
+                        warn!("graph capture forward failed, falling back: {e}");
+                        let _ = self.graph_runner.pool_mut().end_capture_on(
+                            &cuda_stream, padded_batch,
+                        );
+                        self.graph_runner.mark_captured(padded_batch);
+                        // Fall through to normal path below
+                    }
                 }
             }
         }

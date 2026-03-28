@@ -13,7 +13,7 @@ mod inner {
     use tokio::sync::{mpsc, oneshot};
     use tokio_stream::wrappers::ReceiverStream;
     use tokio_util::sync::CancellationToken;
-    use tracing::{debug, error, info, warn};
+    use tracing::{debug, error, info, trace, warn};
 
     use rvllm_config::EngineConfig;
     use rvllm_core::prelude::{LLMError, RequestId, RequestOutput, Result, SamplingParams};
@@ -182,6 +182,7 @@ mod inner {
         ) {
             let mut output_channels: HashMap<RequestId, mpsc::Sender<RequestOutput>> =
                 HashMap::new();
+            let mut step_counter: u32 = 0;
 
             loop {
                 if cancel.is_cancelled() {
@@ -245,8 +246,11 @@ mod inner {
                     }
                 }
 
-                // Yield to let other tokio tasks run
-                tokio::task::yield_now().await;
+                // Yield periodically to avoid starving other tokio tasks
+                step_counter = step_counter.wrapping_add(1);
+                if step_counter % 64 == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
 
             // Notify remaining streaming clients that we're shutting down

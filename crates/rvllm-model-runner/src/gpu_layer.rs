@@ -169,14 +169,14 @@ mod inner {
             let q_dim = num_heads * head_dim;
             let kv_dim = num_kv_heads * head_dim;
 
-            let mut q = CudaLinearLayer::forward_once_f16(
-                &normed, weights.q_proj, num_tokens, q_dim, hidden, blas, &self.loader,
+            let mut q = CudaLinearLayer::forward_mixed(
+                &normed, weights.q_proj, num_tokens, q_dim, hidden, blas,
             )?;
-            let mut k = CudaLinearLayer::forward_once_f16(
-                &normed, weights.k_proj, num_tokens, kv_dim, hidden, blas, &self.loader,
+            let mut k = CudaLinearLayer::forward_mixed(
+                &normed, weights.k_proj, num_tokens, kv_dim, hidden, blas,
             )?;
-            let mut v = CudaLinearLayer::forward_once_f16(
-                &normed, weights.v_proj, num_tokens, kv_dim, hidden, blas, &self.loader,
+            let mut v = CudaLinearLayer::forward_mixed(
+                &normed, weights.v_proj, num_tokens, kv_dim, hidden, blas,
             )?;
 
             // QKV biases (f32)
@@ -190,12 +190,12 @@ mod inner {
                 Self::add_bias(&self.stream, &self.loader, &mut v, bias, num_tokens, kv_dim)?;
             }
 
-            // 3. RoPE
-            let (q_rot, k_rot) = Self::apply_rotary_embedding(
+            // 3. RoPE (in-place on q and k)
+            Self::apply_rotary_embedding_inplace(
                 &self.stream,
                 &self.loader,
-                &q,
-                &k,
+                &mut q,
+                &mut k,
                 input.positions,
                 input.rope_cos,
                 input.rope_sin,
@@ -209,7 +209,7 @@ mod inner {
             Self::cache_write(
                 &self.stream,
                 &self.loader,
-                &k_rot,
+                &k,
                 &v,
                 input.key_cache,
                 input.value_cache,
@@ -223,7 +223,7 @@ mod inner {
                 Self::prefill_attention(
                     &self.stream,
                     &self.loader,
-                    &q_rot,
+                    &q,
                     input.key_cache,
                     input.value_cache,
                     input.block_tables,
@@ -241,7 +241,7 @@ mod inner {
                 Self::decode_attention(
                     &self.stream,
                     &self.loader,
-                    &q_rot,
+                    &q,
                     input.key_cache,
                     input.value_cache,
                     input.block_tables,
@@ -257,40 +257,29 @@ mod inner {
             };
 
             // 5. Output projection (f16 weight)
-            let attn_proj = CudaLinearLayer::forward_once_f16(
-                &attn_out, weights.o_proj, num_tokens, hidden, q_dim, blas, &self.loader,
+            let attn_proj = CudaLinearLayer::forward_mixed(
+                &attn_out, weights.o_proj, num_tokens, hidden, q_dim, blas,
             )?;
 
-            // Residual
-            let residual = Self::add_tensors(
-                &self.stream,
-                &self.loader,
-                input.hidden_states,
-                &attn_proj,
-                num_tokens * hidden,
-            )?;
-
-            // 6. Post-attention RMSNorm (f32)
-            let normed2 = Self::rms_norm(
-                &self.stream,
-                &self.loader,
-                &residual,
-                weights.post_attention_layernorm,
-                cfg.rms_norm_eps,
-                num_tokens,
-                hidden,
+            // Fused residual + post-attention RMSNorm (1 kernel instead of 2)
+            let fused_rn_kernel = self.loader.get_func("fused_residual_rmsnorm", "fused_residual_rmsnorm_kernel")?;
+            let (normed2, residual) = crate::layers::fused_ops::fused_residual_rmsnorm(
+                &self.stream, &fused_rn_kernel,
+                input.hidden_states, &attn_proj,
+                weights.post_attention_layernorm, cfg.rms_norm_eps,
+                num_tokens, hidden,
             )?;
 
             // 7. MLP (f16 weights)
-            let gate = CudaLinearLayer::forward_once_f16(
-                &normed2, weights.gate_proj, num_tokens, intermediate, hidden, blas, &self.loader,
+            let gate = CudaLinearLayer::forward_mixed(
+                &normed2, weights.gate_proj, num_tokens, intermediate, hidden, blas,
             )?;
-            let up = CudaLinearLayer::forward_once_f16(
-                &normed2, weights.up_proj, num_tokens, intermediate, hidden, blas, &self.loader,
+            let up = CudaLinearLayer::forward_mixed(
+                &normed2, weights.up_proj, num_tokens, intermediate, hidden, blas,
             )?;
             let fused = Self::fused_silu_mul(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
-            let mlp_out = CudaLinearLayer::forward_once_f16(
-                &fused, weights.down_proj, num_tokens, hidden, intermediate, blas, &self.loader,
+            let mlp_out = CudaLinearLayer::forward_mixed(
+                &fused, weights.down_proj, num_tokens, hidden, intermediate, blas,
             )?;
 
             // 8. Residual
@@ -379,13 +368,13 @@ mod inner {
             }
 
             // ---------------------------------------------------------------
-            // 3. RoPE on Q and K
+            // 3. RoPE on Q and K (in-place)
             // ---------------------------------------------------------------
-            let (q_rot, k_rot) = Self::apply_rotary_embedding(
+            Self::apply_rotary_embedding_inplace(
                 &self.stream,
                 &self.loader,
-                &q,
-                &k,
+                &mut q,
+                &mut k,
                 input.positions,
                 input.rope_cos,
                 input.rope_sin,
@@ -403,7 +392,7 @@ mod inner {
             Self::cache_write(
                 &self.stream,
                 &self.loader,
-                &k_rot,
+                &k,
                 &v,
                 input.key_cache,
                 input.value_cache,
@@ -421,7 +410,7 @@ mod inner {
                 Self::prefill_attention(
                     &self.stream,
                     &self.loader,
-                    &q_rot,
+                    &q,
                     input.key_cache,
                     input.value_cache,
                     input.block_tables,
@@ -441,7 +430,7 @@ mod inner {
                 Self::decode_attention(
                     &self.stream,
                     &self.loader,
-                    &q_rot,
+                    &q,
                     input.key_cache,
                     input.value_cache,
                     input.block_tables,
@@ -470,27 +459,14 @@ mod inner {
             )?;
 
             // ---------------------------------------------------------------
-            // Residual: hidden_states + attn_proj
+            // Fused residual + post-attention RMSNorm (1 kernel instead of 2)
             // ---------------------------------------------------------------
-            let residual = Self::add_tensors(
-                &self.stream,
-                &self.loader,
-                input.hidden_states,
-                &attn_proj,
-                num_tokens * hidden,
-            )?;
-
-            // ---------------------------------------------------------------
-            // 6. Post-attention RMSNorm
-            // ---------------------------------------------------------------
-            let normed2 = Self::rms_norm(
-                &self.stream,
-                &self.loader,
-                &residual,
-                weights.post_attention_layernorm,
-                cfg.rms_norm_eps,
-                num_tokens,
-                hidden,
+            let fused_rn_kernel = self.loader.get_func("fused_residual_rmsnorm", "fused_residual_rmsnorm_kernel")?;
+            let (normed2, residual) = crate::layers::fused_ops::fused_residual_rmsnorm(
+                &self.stream, &fused_rn_kernel,
+                input.hidden_states, &attn_proj,
+                weights.post_attention_layernorm, cfg.rms_norm_eps,
+                num_tokens, hidden,
             )?;
 
             // ---------------------------------------------------------------
@@ -641,15 +617,54 @@ mod inner {
             Ok(output)
         }
 
-        /// Apply rotary positional embeddings to Q and K tensors.
-        ///
-        /// Dispatches to the rotary_embedding CUDA kernel.
-        /// Q shape: [num_tokens, num_heads * head_dim]
-        /// K shape: [num_tokens, num_kv_heads * head_dim]
-        /// positions: [num_tokens]
-        /// Apply RoPE to Q and K in a single kernel launch.
-        /// Kernel signature: (query, key, cos_cache, sin_cache, positions,
-        ///                     num_tokens, num_heads, num_kv_heads, head_dim)
+        /// Apply RoPE in-place on Q and K -- zero allocs, zero copies.
+        #[allow(clippy::too_many_arguments)]
+        fn apply_rotary_embedding_inplace(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            q: &mut CudaSlice<f32>,
+            k: &mut CudaSlice<f32>,
+            positions: &CudaSlice<i32>,
+            rope_cos: &CudaSlice<f32>,
+            rope_sin: &CudaSlice<f32>,
+            num_tokens: usize,
+            num_heads: usize,
+            num_kv_heads: usize,
+            head_dim: usize,
+        ) -> Result<()> {
+            let kernel = loader.get_func("rotary_embedding", "rotary_embedding_kernel")?;
+            let half_dim = head_dim / 2;
+            let grid_y = num_heads.max(num_kv_heads) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, grid_y, 1),
+                block_dim: (half_dim.min(1024) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let num_tokens_i32 = num_tokens as i32;
+            let num_heads_i32 = num_heads as i32;
+            let num_kv_heads_i32 = num_kv_heads as i32;
+            let head_dim_i32 = head_dim as i32;
+            unsafe {
+                stream
+                    .launch_builder(&kernel)
+                    .arg(q)
+                    .arg(k)
+                    .arg(rope_cos)
+                    .arg(rope_sin)
+                    .arg(positions)
+                    .arg(&num_tokens_i32)
+                    .arg(&num_heads_i32)
+                    .arg(&num_kv_heads_i32)
+                    .arg(&head_dim_i32)
+                    .launch(cfg)
+                    .map_err(|e| LLMError::GpuError(format!("rope inplace launch: {e}")))?;
+            }
+            Ok(())
+        }
+
+        /// DEPRECATED: use apply_rotary_embedding_inplace instead.
+        /// Kept for backward compatibility -- allocates q_out/k_out copies.
+        #[allow(dead_code)]
         fn apply_rotary_embedding(
             stream: &Arc<CudaStream>,
             loader: &KernelLoader,
