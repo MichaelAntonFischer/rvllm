@@ -1114,6 +1114,21 @@ impl GpuWorker {
     /// Metadata uploads happen OUTSIDE graph capture/replay so the memcpy_htod
     /// updates the persistent buffer contents in-place. The graph's kernels then
     /// read fresh data from the same GPU pointers that were baked in at capture.
+    /// Pad a batch size up to the nearest "capture bucket".
+    /// Buckets: 1, 2, 4, 8, then every 8 up to 256, then every 32 up to 512.
+    fn padded_batch_size(batch: usize) -> usize {
+        if batch <= 1 { return 1; }
+        if batch <= 2 { return 2; }
+        if batch <= 4 { return 4; }
+        if batch <= 8 { return 8; }
+        if batch <= 256 {
+            // Round up to nearest 8
+            return (batch + 7) & !7;
+        }
+        // Round up to nearest 32
+        (batch + 31) & !31
+    }
+
     fn gpu_forward_ex(
         &mut self,
         model_input: &ModelInput,
@@ -1132,20 +1147,21 @@ impl GpuWorker {
         #[cfg(feature = "cuda")]
         {
             let batch = model_input.num_tokens();
+            let padded = Self::padded_batch_size(batch);
 
-            // 1. Exact graph replay (hot path: ~0.1ms)
-            if self.graph_runner.has_graph_for_exact(batch) {
-                return self.gpu_forward_ex_graphed_exact(model_input, batch, greedy_only);
+            // 1. Check for padded graph (hot path)
+            if self.graph_runner.has_graph_for_exact(padded) {
+                return self.gpu_forward_ex_graphed_padded(model_input, batch, padded, greedy_only);
             }
 
-            // 2. Past warmup? Capture a graph for this batch size
+            // 2. Past warmup? Capture a graph for this padded batch size
             if self.forward_count > Self::GRAPH_WARMUP_CALLS
-                && !self.graph_runner.was_capture_attempted(batch)
+                && !self.graph_runner.was_capture_attempted(padded)
             {
-                match self.try_capture_graph_exact(model_input, batch, greedy_only) {
+                match self.try_capture_graph_padded(model_input, batch, padded, greedy_only) {
                     Ok(output) => return Ok(output),
                     Err(e) => {
-                        warn!(batch, "graph capture failed, raw forward: {e}");
+                        warn!(padded, "graph capture failed, raw forward: {e}");
                     }
                 }
             }
@@ -1155,96 +1171,100 @@ impl GpuWorker {
         self.raw_gpu_forward_ex(model_input, greedy_only)
     }
 
-    /// Replay a captured graph for an exact batch size. No padding.
+    /// Replay a captured graph for a padded batch size, return only actual_batch results.
     #[cfg(feature = "cuda")]
-    fn gpu_forward_ex_graphed_exact(
+    fn gpu_forward_ex_graphed_padded(
         &mut self,
         model_input: &ModelInput,
-        batch: usize,
+        actual_batch: usize,
+        padded_batch: usize,
         _greedy_only: bool,
     ) -> Result<ForwardOutput> {
         let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
             LLMError::GpuError("GPU model runner not initialized".into())
         })?;
 
-        runner.upload_metadata(
+        // Upload padded metadata (runner handles padding internally)
+        runner.upload_metadata_padded(
             &model_input.token_ids,
             &model_input.position_ids,
             &model_input.attention_metadata,
+            padded_batch,
         )?;
 
-        let graph = self.graph_runner.pool().get_exact(batch).ok_or_else(|| {
-            LLMError::GpuError(format!("no graph for exact batch {batch}"))
+        let graph = self.graph_runner.pool().get_exact(padded_batch).ok_or_else(|| {
+            LLMError::GpuError(format!("no graph for padded batch {padded_batch}"))
         })?;
         graph.replay(&self.compute_stream)?;
 
-        let ids = runner.read_graph_output(batch)?;
-        Ok(ForwardOutput::TokenIds(ids))
+        // Read only actual_batch results (ignore padding)
+        let ids = runner.read_graph_output(padded_batch)?;
+        Ok(ForwardOutput::TokenIds(ids[..actual_batch].to_vec()))
     }
 
-    /// Try to capture a graph for an exact batch size. No padding.
-    /// Returns Ok(output) if capture + first replay succeeded.
-    /// Returns Err if capture failed (OOM, etc). Marks as attempted either way.
+    /// Try to capture a graph for a padded batch size.
     #[cfg(feature = "cuda")]
-    fn try_capture_graph_exact(
+    fn try_capture_graph_padded(
         &mut self,
         model_input: &ModelInput,
-        batch: usize,
+        actual_batch: usize,
+        padded_batch: usize,
         _greedy_only: bool,
     ) -> Result<ForwardOutput> {
-        let num_seqs = model_input.attention_metadata.context_lens.len();
         let max_context_len = model_input.attention_metadata.max_context_len;
 
         let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
             LLMError::GpuError("GPU model runner not initialized".into())
         })?;
 
-        info!(batch, "capturing CUDA graph for exact batch size");
+        info!(padded_batch, actual_batch, "capturing CUDA graph for padded batch size");
 
         // Warmup forward (outside capture)
-        runner.upload_metadata(
+        runner.upload_metadata_padded(
             &model_input.token_ids,
             &model_input.position_ids,
             &model_input.attention_metadata,
+            padded_batch,
         )?;
-        runner.forward_gpu_only(batch, num_seqs, max_context_len, false)?;
+        runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false)?;
 
         // Sync before capture
         let cuda_stream = runner.cuda_stream().clone();
         cuda_stream.synchronize()
             .map_err(|e| LLMError::GpuError(format!("pre-capture sync: {e}")))?;
 
-        // Re-upload metadata
-        runner.upload_metadata(
+        // Re-upload padded metadata
+        runner.upload_metadata_padded(
             &model_input.token_ids,
             &model_input.position_ids,
             &model_input.attention_metadata,
+            padded_batch,
         )?;
 
         // Capture
         let capture_result = self.graph_runner.pool_mut().begin_capture_on(&cuda_stream);
         if let Err(e) = capture_result {
-            warn!(batch, "graph capture begin failed: {e}");
-            self.graph_runner.mark_captured(batch);
+            warn!(padded_batch, "graph capture begin failed: {e}");
+            self.graph_runner.mark_captured(padded_batch);
             return Err(LLMError::GpuError(format!("graph capture failed: {e}")));
         }
 
-        let fwd_result = runner.forward_gpu_only(batch, num_seqs, max_context_len, false);
+        let fwd_result = runner.forward_gpu_only(padded_batch, padded_batch, max_context_len, false);
 
         match fwd_result {
             Ok(()) => {
-                let graph = self.graph_runner.pool_mut().end_capture_on(&cuda_stream, batch)?;
+                let graph = self.graph_runner.pool_mut().end_capture_on(&cuda_stream, padded_batch)?;
                 self.graph_runner.pool_mut().insert(graph);
-                self.graph_runner.mark_captured(batch);
-                info!(batch, "CUDA graph captured for exact batch size");
+                self.graph_runner.mark_captured(padded_batch);
+                info!(padded_batch, "CUDA graph captured for padded batch");
 
-                let ids = runner.read_graph_output(batch)?;
-                Ok(ForwardOutput::TokenIds(ids))
+                let ids = runner.read_graph_output(padded_batch)?;
+                Ok(ForwardOutput::TokenIds(ids[..actual_batch].to_vec()))
             }
             Err(e) => {
-                warn!(batch, "graph capture forward failed: {e}");
-                let _ = self.graph_runner.pool_mut().end_capture_on(&cuda_stream, batch);
-                self.graph_runner.mark_captured(batch);
+                warn!(padded_batch, "graph capture forward failed: {e}");
+                let _ = self.graph_runner.pool_mut().end_capture_on(&cuda_stream, padded_batch);
+                self.graph_runner.mark_captured(padded_batch);
                 Err(e)
             }
         }

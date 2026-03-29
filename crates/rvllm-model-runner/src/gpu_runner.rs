@@ -657,6 +657,43 @@ mod cuda_impl {
             Ok(())
         }
 
+        /// Upload metadata padded to `padded_batch` tokens.
+        /// Extra slots are filled with dummy data (duplicating seq 0's metadata).
+        pub fn upload_metadata_padded(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            attn_meta: &crate::bridge::AttentionMetadata,
+            padded_batch: usize,
+        ) -> Result<()> {
+            let actual = token_ids.len();
+            if actual >= padded_batch {
+                return self.upload_metadata(token_ids, positions, attn_meta);
+            }
+            let pad_count = padded_batch - actual;
+
+            // Pad token_ids with 0 (padding token)
+            let mut padded_tokens: Vec<u32> = token_ids.to_vec();
+            padded_tokens.resize(padded_batch, 0);
+
+            // Pad positions with 0
+            let mut padded_positions: Vec<u32> = positions.to_vec();
+            padded_positions.resize(padded_batch, 0);
+
+            // Pad attention metadata
+            let mut padded_meta = attn_meta.clone();
+            let dummy_ctx = if attn_meta.context_lens.is_empty() { 1 } else { attn_meta.context_lens[0] };
+            padded_meta.context_lens.resize(padded_batch, dummy_ctx);
+            padded_meta.query_lens.resize(padded_batch, 1);
+            let dummy_bt = if attn_meta.block_tables.is_empty() { vec![] } else { attn_meta.block_tables[0].clone() };
+            for _ in 0..pad_count {
+                padded_meta.block_tables.push(dummy_bt.clone());
+            }
+            padded_meta.slot_mapping.resize(padded_batch, 0);
+
+            self.upload_metadata(&padded_tokens, &padded_positions, &padded_meta)
+        }
+
         /// Run the forward pass using already-uploaded metadata buffers.
         ///
         /// Call `upload_metadata()` first. This method does NOT upload metadata --
