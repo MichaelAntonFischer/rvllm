@@ -193,15 +193,15 @@ mod inner {
                 let k_end = q_end + num_tokens * kv_dim;
                 {
                     let mut q_dst = qkv_buf.slice_mut(..q_end);
-                    blas.hgemm(num_tokens, q_dim, hidden, f16::ONE, &normed, weights.q_proj, f16::ZERO, &mut q_dst)?;
+                    blas.hgemm_into(num_tokens, q_dim, hidden, 1.0, &normed, weights.q_proj, 0.0, &mut q_dst)?;
                 }
                 {
                     let mut k_dst = qkv_buf.slice_mut(q_end..k_end);
-                    blas.hgemm(num_tokens, kv_dim, hidden, f16::ONE, &normed, weights.k_proj, f16::ZERO, &mut k_dst)?;
+                    blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.k_proj, 0.0, &mut k_dst)?;
                 }
                 {
                     let mut v_dst = qkv_buf.slice_mut(k_end..);
-                    blas.hgemm(num_tokens, kv_dim, hidden, f16::ONE, &normed, weights.v_proj, f16::ZERO, &mut v_dst)?;
+                    blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.v_proj, 0.0, &mut v_dst)?;
                 }
                 qkv_buf
             };
@@ -214,13 +214,13 @@ mod inner {
                 Self::add_bias_f16_view(&self.stream, &self.loader, &mut qkv_view, bias, num_tokens, qkv_dim)?;
             }
 
-            // 4. RoPE f16 in-place on Q and K regions
+            // 4. RoPE f16 in-place on Q and K regions (split_at_mut avoids double borrow)
             {
-                let mut q_view = qkv.slice_mut(..q_end);
-                let mut k_view = qkv.slice_mut(q_end..k_end);
+                let (mut q_part, mut kv_part) = qkv.split_at_mut(q_end);
+                let mut k_view = kv_part.slice_mut(..num_tokens * kv_dim);
                 Self::apply_rotary_embedding_f16_views(
                     &self.stream, &self.loader,
-                    &mut q_view, &mut k_view,
+                    &mut q_part, &mut k_view,
                     &input.positions, input.rope_cos, input.rope_sin,
                     num_tokens, num_heads, num_kv_heads, head_dim,
                 )?;

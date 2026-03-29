@@ -258,6 +258,54 @@ impl CublasHandle {
         Ok(())
     }
 
+    /// HGEMM into a CudaViewMut (for writing into sub-slices of a larger buffer).
+    /// Same math as hgemm but uses cublasGemmEx with raw pointers to accept views.
+    #[cfg(feature = "cuda")]
+    pub fn hgemm_into(
+        &self,
+        m: usize, n: usize, k: usize,
+        alpha: f32,
+        a: &impl DevicePtr<half::f16>,
+        b: &impl DevicePtr<half::f16>,
+        beta: f32,
+        c: &mut impl DevicePtrMut<half::f16>,
+    ) -> Result<()> {
+        use cudarc::cublas::sys::{
+            cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            cublasOperation_t::{CUBLAS_OP_N, CUBLAS_OP_T},
+            cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+            cudaDataType_t::CUDA_R_16F,
+        };
+        let (b_ptr, _bg) = DevicePtr::device_ptr(b, &self.stream);
+        let (a_ptr, _ag) = DevicePtr::device_ptr(a, &self.stream);
+        let (c_ptr, _cg) = DevicePtrMut::device_ptr_mut(c, &self.stream);
+        unsafe {
+            let status = cudarc::cublas::sys::cublasGemmEx(
+                *self.blas.handle(),
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                n as i32, m as i32, k as i32,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                b_ptr as *const std::ffi::c_void, CUDA_R_16F, k as i32,
+                a_ptr as *const std::ffi::c_void, CUDA_R_16F, k as i32,
+                &beta as *const f32 as *const std::ffi::c_void,
+                c_ptr as *mut std::ffi::c_void, CUDA_R_16F, n as i32,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+            );
+            if status != CUBLAS_STATUS_SUCCESS {
+                return Err(crate::LLMError::GpuError(format!("hgemm_into failed: {status:?}")));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn hgemm_into(
+        &self, _m: usize, _n: usize, _k: usize, _alpha: f32,
+        _a: &impl DevicePtr<half::f16>, _b: &impl DevicePtr<half::f16>,
+        _beta: f32, _c: &mut impl DevicePtrMut<half::f16>,
+    ) -> Result<()> { Ok(()) }
+
     /// SGEMM (no transpose): C[m,n] = A[m,k] @ B[k,n]
     ///
     /// Both A and B are row-major. No transpose on either operand.
