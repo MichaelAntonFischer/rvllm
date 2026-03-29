@@ -342,6 +342,10 @@ pub struct GpuWorker {
     graph_runner: GraphRunner,
     /// Number of forward calls so far (for warmup before graph capture).
     forward_count: usize,
+    /// Pinned host buffer for async DtoH pipeline. Allocated on first use.
+    /// Sized to max graph batch size (32 i32 elements).
+    #[cfg(feature = "cuda")]
+    pinned_output: Option<cudarc::driver::PinnedHostSlice<i32>>,
 }
 
 impl GpuWorker {
@@ -453,6 +457,8 @@ impl GpuWorker {
             gpu_model_runner: None,
             graph_runner,
             forward_count: 0,
+            #[cfg(feature = "cuda")]
+            pinned_output: None,
         })
     }
 
@@ -788,6 +794,11 @@ impl GpuWorker {
             ForwardOutput::TokenIds(ref token_ids) => {
                 self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
             }
+            ForwardOutput::TokenIdsPending { actual_batch } => {
+                // Async DtoH was enqueued. Sync now and read from pinned buffer.
+                let token_ids = self.collect_pending_tokens(actual_batch)?;
+                self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?
+            }
             ForwardOutput::Logits(ref logits) => {
                 self.sample_tokens(logits, metadata)?
             }
@@ -809,6 +820,53 @@ impl GpuWorker {
             );
         }
 
+        Ok(GpuWorkerOutput { outputs })
+    }
+
+    /// Launch GPU forward pass and enqueue async DtoH, returning immediately.
+    ///
+    /// Returns `Some(GpuWorkerOutput)` if the forward path is synchronous
+    /// (non-graph path, capture path), or `None` if async DtoH is pending
+    /// and the caller should do CPU work before calling `collect_async_output`.
+    pub fn execute_async(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<Option<GpuWorkerOutput>> {
+        if metadata.is_empty() {
+            return Ok(Some(GpuWorkerOutput {
+                outputs: Vec::new(),
+            }));
+        }
+
+        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let greedy_only = Self::all_greedy(metadata);
+        let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
+
+        match fwd_output {
+            ForwardOutput::TokenIdsPending { .. } => {
+                // Async DtoH in flight -- caller should do CPU work then call collect
+                Ok(None)
+            }
+            ForwardOutput::TokenIds(ref token_ids) => {
+                let outputs = self.sample_tokens_from_gpu_argmax(token_ids, metadata)?;
+                Ok(Some(GpuWorkerOutput { outputs }))
+            }
+            ForwardOutput::Logits(ref logits) => {
+                let outputs = self.sample_tokens(logits, metadata)?;
+                Ok(Some(GpuWorkerOutput { outputs }))
+            }
+        }
+    }
+
+    /// Synchronize the GPU stream and read the pending async DtoH output.
+    ///
+    /// Call after `execute_async` returned `None` (indicating async DtoH
+    /// is in flight). Does CPU work between the async launch and this call
+    /// to overlap with GPU compute + DtoH transfer.
+    pub fn collect_async_output(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<GpuWorkerOutput> {
+        // Determine actual batch size from metadata
+        let actual_batch: usize = metadata.iter()
+            .map(|g| g.seq_data.len())
+            .sum();
+        let token_ids = self.collect_pending_tokens(actual_batch)?;
+        let outputs = self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?;
         Ok(GpuWorkerOutput { outputs })
     }
 
@@ -889,7 +947,9 @@ impl GpuWorker {
     fn gpu_forward(&mut self, model_input: &ModelInput) -> Result<Vec<f32>> {
         match self.gpu_forward_ex(model_input, false)? {
             ForwardOutput::Logits(logits) => Ok(logits),
-            ForwardOutput::TokenIds(_) => unreachable!("greedy_only=false must return Logits"),
+            ForwardOutput::TokenIds(_) | ForwardOutput::TokenIdsPending { .. } => {
+                unreachable!("greedy_only=false must return Logits")
+            }
         }
     }
 
@@ -963,7 +1023,7 @@ impl GpuWorker {
         let t_upload = t0.elapsed();
 
         if self.graph_runner.has_graph_for(padded_batch) {
-            // -- REPLAY path --
+            // -- REPLAY path (async DtoH pipeline) --
             let pool = self.graph_runner.pool();
             let graph = pool.get(actual_batch).ok_or_else(|| {
                 LLMError::GpuError("graph lookup failed after has_graph_for".into())
@@ -971,25 +1031,29 @@ impl GpuWorker {
             graph.replay(&self.compute_stream)?;
             let t_replay = t0.elapsed();
 
-            // DtoH read from persistent output buffer (outside graph).
-            let ids = runner.read_graph_output(num_tokens)?;
-            let t_read = t0.elapsed();
+            // Lazily allocate pinned host buffer for async DtoH.
+            if self.pinned_output.is_none() {
+                let pinned = unsafe { self.context.alloc_pinned::<i32>(32) }
+                    .map_err(|e| LLMError::GpuError(format!("pinned alloc: {e}")))?;
+                self.pinned_output = Some(pinned);
+            }
 
-            let trimmed: Vec<i32> = ids[..actual_batch].to_vec();
+            // Enqueue async DtoH into pinned buffer (returns immediately).
+            let pinned = self.pinned_output.as_mut().unwrap();
+            runner.read_graph_output_async(pinned)?;
 
             if self.forward_count % 64 == 0 {
                 let upload_us = t_upload.as_micros();
                 let replay_us = (t_replay - t_upload).as_micros();
-                let read_us = (t_read - t_replay).as_micros();
                 info!(
-                    upload_us, replay_us, read_us,
-                    total_us = t_read.as_micros(),
+                    upload_us, replay_us,
+                    total_us = t0.elapsed().as_micros(),
                     batch = actual_batch,
-                    "TIMING graph_replay"
+                    "TIMING graph_replay (async DtoH enqueued)"
                 );
             }
 
-            return Ok(ForwardOutput::TokenIds(trimmed));
+            return Ok(ForwardOutput::TokenIdsPending { actual_batch });
         }
 
         if self.forward_count > Self::GRAPH_WARMUP_CALLS
@@ -1063,6 +1127,10 @@ impl GpuWorker {
             ForwardOutput::TokenIds(ref ids) => {
                 let trimmed: Vec<i32> = ids[..actual_batch].to_vec();
                 Ok(ForwardOutput::TokenIds(trimmed))
+            }
+            ForwardOutput::TokenIdsPending { .. } => {
+                // forward_graph_body doesn't produce pending output
+                unreachable!("forward_graph_body should not return TokenIdsPending")
             }
             ForwardOutput::Logits(ref logits) => {
                 let unpadded = self.graph_runner.unpad_logits(logits, actual_batch);
@@ -1705,6 +1773,27 @@ impl GpuWorker {
     }
 
     /// Fast path: convert GPU-side argmax token IDs to sampling results.
+    /// Synchronize the runner stream and read token IDs from the pinned buffer.
+    /// Called after an async DtoH was enqueued via `ForwardOutput::TokenIdsPending`.
+    #[cfg(feature = "cuda")]
+    fn collect_pending_tokens(&mut self, actual_batch: usize) -> Result<Vec<i32>> {
+        let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
+            LLMError::GpuError("GPU model runner not initialized".into())
+        })?;
+        runner.sync_stream()?;
+        let pinned = self.pinned_output.as_ref().ok_or_else(|| {
+            LLMError::GpuError("pinned output buffer not allocated".into())
+        })?;
+        let slice = pinned.as_slice()
+            .map_err(|e| LLMError::GpuError(format!("pinned buf read: {e}")))?;
+        Ok(slice[..actual_batch].to_vec())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn collect_pending_tokens(&mut self, _actual_batch: usize) -> Result<Vec<i32>> {
+        Err(LLMError::GpuError("async DtoH requires cuda feature".into()))
+    }
+
     /// Used when all requests in the batch use temperature=0 (greedy).
     /// The argmax kernel produces one token ID per input token row;
     /// we pick the last token per sequence (same logic as sample_tokens).

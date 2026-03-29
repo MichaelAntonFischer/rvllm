@@ -17,6 +17,11 @@ pub enum ForwardOutput {
     Logits(Vec<f32>),
     /// GPU-side argmax token IDs: [num_tokens] i32 (greedy fast path).
     TokenIds(Vec<i32>),
+    /// Async DtoH in progress: token IDs are in a pinned host buffer but
+    /// the stream has not been synchronized yet. The caller must call
+    /// `sync_stream()` + read from the pinned buffer before using the data.
+    /// Fields: (actual_batch_size,) -- the pinned buffer lives on the worker.
+    TokenIdsPending { actual_batch: usize },
 }
 
 #[cfg(feature = "cuda")]
@@ -454,7 +459,9 @@ mod cuda_impl {
         ) -> Result<Vec<f32>> {
             match self.forward_ex(token_ids, positions, attn_meta, is_prefill, false)? {
                 ForwardOutput::Logits(logits) => Ok(logits),
-                ForwardOutput::TokenIds(_) => unreachable!("greedy_only=false must return Logits"),
+                ForwardOutput::TokenIds(_) | ForwardOutput::TokenIdsPending { .. } => {
+                    unreachable!("greedy_only=false must return Logits")
+                }
             }
         }
 
@@ -1235,6 +1242,33 @@ mod cuda_impl {
             Ok(full[..num_tokens].to_vec())
         }
 
+        /// Enqueue an async DtoH copy of graph output into a pinned host buffer.
+        ///
+        /// Unlike `read_graph_output`, this does NOT synchronize the stream.
+        /// The caller must call `sync_stream()` before reading from `dst`.
+        /// `dst` MUST be pinned host memory for truly async behavior; with
+        /// pageable memory cuMemcpyDtoHAsync degrades to synchronous.
+        pub fn read_graph_output_async<Dst: cudarc::driver::HostSlice<i32> + ?Sized>(
+            &self,
+            dst: &mut Dst,
+        ) -> Result<()> {
+            let out = self.graph_output.borrow();
+            let buf = out.as_ref().ok_or_else(|| {
+                LLMError::GpuError("graph_output not populated -- call forward_gpu_only first".into())
+            })?;
+            self.stream.memcpy_dtoh(buf, dst)
+                .map_err(|e| LLMError::GpuError(format!("graph_output async DtoH: {e}")))?;
+            Ok(())
+        }
+
+        /// Synchronize the runner's CUDA stream, blocking until all enqueued
+        /// work (graph replay + async DtoH) completes.
+        pub fn sync_stream(&self) -> Result<()> {
+            self.stream.synchronize()
+                .map_err(|e| LLMError::GpuError(format!("stream sync: {e}")))?;
+            Ok(())
+        }
+
         /// Launch argmax kernel on GPU, returning [num_tokens] i32 token IDs.
         fn gpu_argmax(
             &self,
@@ -1806,6 +1840,18 @@ mod mock_impl {
         }
 
         pub fn read_graph_output(&self, _num_tokens: usize) -> Result<Vec<i32>> {
+            Err(LLMError::GpuError(
+                "GpuModelRunner requires the `cuda` feature".into(),
+            ))
+        }
+
+        pub fn read_graph_output_async(&self, _dst: &mut [i32]) -> Result<()> {
+            Err(LLMError::GpuError(
+                "GpuModelRunner requires the `cuda` feature".into(),
+            ))
+        }
+
+        pub fn sync_stream(&self) -> Result<()> {
             Err(LLMError::GpuError(
                 "GpuModelRunner requires the `cuda` feature".into(),
             ))
