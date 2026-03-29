@@ -1064,26 +1064,7 @@ impl GpuWorker {
             return self.raw_gpu_forward_ex(model_input, greedy_only);
         }
 
-        let batch = model_input.num_tokens();
-
-        // Graph replay: exact batch size match only. No padding.
-        if self.graph_runner.has_graph_for_exact(batch) {
-            return self.gpu_forward_ex_graphed_exact(model_input, batch, greedy_only);
-        }
-
-        // Graph capture: only after seeing this exact batch size N times.
-        // No padding. If capture fails, mark as uncapturable, never retry.
-        if self.forward_count > Self::GRAPH_WARMUP_CALLS
-            && !self.graph_runner.was_capture_attempted(batch)
-            && batch <= 32  // only capture for small batches (larger ones OOM)
-        {
-            match self.try_capture_graph_exact(model_input, batch, greedy_only) {
-                Ok(output) => return Ok(output),
-                Err(_) => {} // fall through to raw
-            }
-        }
-
-        // Default: raw forward, no padding, no graphs
+        // Raw forward. Graphs disabled pending proper CUDA driver compat fix.
         self.raw_gpu_forward_ex(model_input, greedy_only)
     }
 
