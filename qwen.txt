@@ -1,0 +1,53 @@
+              
+⏺ Zero warnings, 111 tests pass. Here's what's on the branch now:                                                          
+                                                                                                                           
+  CUDA kernels (kernels/):                                                                                                 
+  - causal_conv1d.cu -- prefill (full sequence) + decode (single-step with rolling state)                                  
+  - deltanet.cu -- decode recurrence, sequential prefill, L2 normalize, discretize A_log/dt_bias, fused gated output (y *  
+  silu(z))                                                                                                               
+                                                                                                                           
+  CUDA Rust wrappers (layers/):                                                                                            
+  - conv1d_cuda.rs -- CudaCausalConv1d wrapping both kernels via cudarc                                                    
+  - deltanet_cuda.rs -- CudaDeltaNet wrapping all 5 kernels (decode, prefill, l2_norm, discretize, gated_output)           
+                                                                                                                           
+  Architecture (architectures/qwen3_5.rs):                                                                                 
+  - Weight loading + enum dispatch works in mock-gpu                                                                       
+  - Linear attention path is wired to produce zeros in mock mode, CUDA kernels at runtime with --features cuda             
+                                                                                                                           
+  Stripped: CPU-only loop implementations removed from conv1d.rs and deltanet.rs, replaced with test-only reference code.  
+                                                                                                                           
+✻ Sautéed for 5m 59s                                                                                                       
+                                                                                                                           
+❯ anything left?                                                                                                           
+                 
+⏺ Bash(git diff --stat main 2>&1)                                                                                          
+  ⎿   crates/rvllm-model-loader/src/mapper.rs            | 18 ++++++++++++++++++                                           
+      crates/rvllm-model-runner/src/architectures/mod.rs |  4 ++++
+      crates/rvllm-model-runner/src/layers/mod.rs        |  6 ++++++                                                       
+      3 files changed, 28 insertions(+)                                                                                    
+             
+  Searched for 1 pattern (ctrl+o to expand)                                                                                
+                  
+⏺ Bash(git status 2>&1)
+  ⎿  On branch qwen3.5-support                                                                                             
+     Changes not staged for commit:                                                                                    
+       (use "git add <file>..." to update what will be committed)                                                          
+     … +17 lines (ctrl+o to expand)                                                                                        
+                                                                                                                           
+⏺ Code's all there. Remaining gaps:                                                                                        
+                                                                                                                           
+  1. full_attention_interval hardcoded to 4 -- needs config.json parsing                                                   
+  2. No per-sequence recurrent state management -- DeltaNet state must persist across decode steps per sequence, integrated
+   with the scheduler for continuous batching                                                                              
+  3. No dt projection -- zeroed currently, need to check if Qwen3.5 has a learned dt projection weight
+  4. Conv1d only on Q -- need to verify from HF source if K also gets convolved                                            
+  5. QKV split assumes equal d_k=d_v -- may differ per model size                                                          
+  6. CUDA kernel build integration -- kernels need to be compiled to PTX and wired into KernelLoader                       
+  7. No f16 kernel variants -- existing codebase has _f16.cu versions of most kernels                                      
+  8. Actual end-to-end test on H100 with a real Qwen3.5 checkpoint                                                         
+                                                                                                                           
+  Items 1-5 are quick fixes once we can inspect a real config.json. Item 6 is plumbing. Item 2 (state management) is the   
+  hardest -- it's a scheduler-level change.                                                                                
+                                                                                                                           
+  Want me to tackle any of these, or commit what's here and move to the H100 bench?                                        
+  

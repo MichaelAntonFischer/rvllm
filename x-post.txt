@@ -1,57 +1,43 @@
-rvLLM -- vLLM rewritten in Rust from scratch. One dev, $1,780 in compute.
-6,385 tok/s on A100. Beats Python vLLM 0.11.0 at N=1 through N=32. 20x faster startup. 31x smaller binary.
-head-to-head (same A100 80GB SXM4, Qwen2.5-1.5B, greedy, 32 tok/req)
-N=1:    rvLLM  217  |  vLLM  207   1.05x
-N=2:    rvLLM  463  |  vLLM  438   1.06x
-N=4:    rvLLM  827  |  vLLM  867   0.95x
-N=8:    rvLLM 1772  |  vLLM 1689   1.05x
-N=16:   rvLLM 3303  |  vLLM 3123   1.06x
-N=32:   rvLLM 6385  |  vLLM 5405   1.18x
-N=48+:  vLLM scales further (15,414 at N=1024)
-rvLLM currently caps at N=32 due to KV cache management. fixing this is the active bottleneck.
-what is it
-from-scratch Rust implementation of vLLM. drop-in OpenAI API replacement. same endpoints, same format. 16 MB static binary. zero python dependencies.
-the build
-23 Rust crates. 15 hand-written CUDA kernels. 792 tests. built in ~22 hours with Claude Opus doing architecture, CUDA kernels, debugging, and 30-agent swarms for major optimization passes. $1,500 vast.ai GPU rentals + $280 Claude Code usage.
-architecture (current)
-- full f16 forward path -- zero cast kernels in the decode inner loop
-- fused QKV + gate+up weight concatenation (5 GEMMs -> 2 per layer)
-- cross-layer residual+RMSNorm fusion (-28 kernel launches per forward)
-- CUDA graph capture/replay (full decode forward as single graph launch, 60us dispatch)
-- dedicated GPU OS thread (tokio async loop stays responsive during 4ms GPU compute)
-- async DtoH with pinned host memory
-- FlashAttention-2 with paged KV cache, GQA, f16 I/O
-- custom GEMV kernel + cublasLt split-K for M=1 decode
-- in-place RoPE, packed metadata HtoD (6 transfers -> 1), memset elimination
-- continuous batching with preemption and prefix caching
-- 10 model architectures (Llama, Mistral, Qwen2, Phi, Gemma, Mixtral, DeepSeek, GPT-NeoX, StableLM, Cohere)
-the optimization journey
-started at 130 tok/s. ended at 6,385 tok/s. here's how:
-phase 4 -- CUDA graph capture (130 tok/s)
-graph capture kept failing with CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED. found 3 root causes: default stream can't capture, cuBLAS needs explicit workspace, cudarc event tracking creates cross-phase dependencies. fixed all three. graph working end-to-end.
-phase 5 -- 10-agent swarm (174 tok/s)
-launched 10 agents in parallel worktrees. each owned different files. eliminated output casts (forward_mixed), fused residual+RMSNorm, in-place RoPE, packed metadata HtoD, engine yield removal, hot-path logging downgrade. merged sequentially, coherency-checked between each.
-full f16 forward (200 tok/s)
-rewrote the entire forward path to stay in f16 from embedding to argmax. zero casts. wrote flash_attention_2_decode_f16io_kernel (f16 Q/output). pre-converted norm weights and biases at load time. every kernel has an f16 variant.
-9-agent kernel efficiency (236 tok/s)
-cross-layer add+norm fusion (-28 kernel launches). replaced alloc_zeros with unsafe alloc for immediately-overwritten buffers. CUDA memory pool release threshold = u64::MAX. cuBLAS warmup. in-place rms_norm_f16. allocation audit found 5 reusable buffers per layer.
-GPU thread model (6,385 tok/s at N=32)
-spawned dedicated OS thread for engine.step(). the tokio async loop stays responsive during 4ms GPU compute. new requests drain from channels while GPU is busy. replaced spin+yield polling with tokio::sync::mpsc .await (zero-cost async wait).
-the wall
-at N=1, per-token time is 4.2ms. theoretical minimum is 1.5ms (reading 3GB weights at 2039 GB/s). the 2.7ms gap is DRAM access patterns -- custom GEMV, cuBLAS, and cublasLt all converge to the same number. this is the hardware efficiency frontier for this model on A100.
-at N>32, rvLLM fails due to KV cache exhaustion. vLLM scales to N=1024 (15,414 tok/s) thanks to mature continuous batching and memory management. closing this gap is the next priority.
+*update 2026-03-29 16:00 UTC*
+rvLLM -- vLLM rewritten in Rust from scratch. 12,673 tok/s on H100. Pure f16. CUDA graphs. Coherent output.
+H100 80GB, Qwen2.5-1.5B, greedy, 100 tok/req:
+N=1:     197 tok/s
+N=2:     506 tok/s
+N=4:     976 tok/s
+N=8:   1,905 tok/s
+N=16:  3,564 tok/s
+N=32:  5,714 tok/s
+N=64: 10,016 tok/s
+N=128: 12,673 tok/s
+near-linear scaling. zero failures N=1 through N=128. all via CUDA graph replay.
+what changed since last post
+- removed ALL f32 from the data path. weights, hidden states, embeddings, norms, KV cache -- everything is f16. f32 only remains for RoPE trig tables and the final argmax logits boundary.
+- found and fixed the coherence bug. fused QKV GEMM outputs [T, QKV_dim] (interleaved per token) but the split assumed [all_Q | all_K | all_V] layout. identical for T=1 (decode), completely wrong for T>1 (prefill). corrupted the KV cache on every prompt. fix: unfused projections for prefill, fused for decode.
+- rms_norm_eps was hardcoded at 1e-5 instead of reading from model config (Qwen2.5 uses 1e-6). now read from config.json and logged at startup.
+- pre-allocated metadata + output GPU buffers at max size so CUDA graph-captured pointers never go stale on reallocation.
+- removed ~530 lines of dead f32 CPU attention fallback code. removed duplicate f32 weight storage (was loading weights twice -- once f32, once f16).
+architecture
+- pure f16 forward: embed(f16) -> 28 layers(f16) -> norm(f16) -> LM head(f16xf16->f32) -> argmax
+- fused QKV + gate+up weights for decode (T=1): 5 GEMMs -> 2 per layer
+- unfused for prefill (T>1): correct [all_Q | all_K | all_V] layout
+- cross-layer residual+RMSNorm fusion
+- CUDA graph capture per exact batch size, 1 cuGraphLaunch replaces 284 kernel launches
+- custom GEMV (M=1) + cublasLt split-K (M<=32) + cuBLAS hgemm (M>32)
+- FlashAttention-2 decode with f16 I/O, f16 KV cache
+- dedicated GPU OS thread, async DtoH with pinned memory
+- 10 architectures: Llama, Mistral, Qwen2, Phi, Gemma, Mixtral, DeepSeek, GPT-NeoX, StableLM, Cohere
+previous A100 results (still valid)
+N=32: 6,385 tok/s on A100, beating Python vLLM 0.11.0 by 18%
 what's next
-- fix N>32 ceiling (KV cache management, max_num_seqs scaling)
-- INT8/FP8 quantization (halve weight reads -> ~2ms/tok -> ~500 tok/s at N=1)
-- speculative decoding (amortize weight reads across draft tokens)
-- async engine overlap with new request arrival processing
-- B200 benchmarks (180GB VRAM, much higher N ceiling)
-system comparison
+- stabilize N=256+ (connection-level issue, not GPU)
+- direct batch API (bypass HTTP for benchmarking at high N)
+- INT8/FP8 quantization
+- speculative decoding
+- multi-GPU tensor parallel
+system
 - startup: 6s vs ~120s (20x)
 - binary: 16 MB vs ~500 MB (31x)
 - memory: 348 MB vs ~1 GB (3x)
-
 repo: https://github.com/m0at/rvllm
 paper: https://m0at.github.io/rvllm/paper/rvllm.pdf
-site: https://m0at.github.io/rvllm/
-Apache-2.0. open source. PRs welcome.
+Apache-2.0. open source.

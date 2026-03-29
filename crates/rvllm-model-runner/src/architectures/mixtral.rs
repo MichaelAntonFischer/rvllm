@@ -228,7 +228,7 @@ mod tests {
             vocab_size: 8,
             max_position: 32,
             dtype: rvllm_core::types::Dtype::Float16,
-            rope_theta: 10000.0,
+            rms_norm_eps: 1e-5, rope_theta: 10000.0,
             architecture: "MixtralForCausalLM".into(),
         }
     }

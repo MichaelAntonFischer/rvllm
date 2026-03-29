@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**23 Rust crates. 15 CUDA kernels. 6,098 tok/s on A100 (FP16). Beats Python vLLM 0.11.0 by 27% at N=32. Full f16 forward, zero casts, CUDA graph replay. 20x faster startup. 31x smaller.**
+**23 Rust crates. 28 CUDA kernels. 12,673 tok/s on H100 (FP16, N=128). Pure f16 end-to-end, CUDA graph replay, coherent output verified. 20x faster startup. 31x smaller.**
 
 ## Install
 
@@ -16,20 +16,21 @@ pip install rvllm
 
 Or build from source -- see [Quick Start](#quick-start) below.
 
-## Benchmarks (Qwen2.5-1.5B, A100 80GB SXM4)
+## Benchmarks (Qwen2.5-1.5B, H100 80GB HBM3)
 
-Head-to-head on the same hardware, same model, greedy decoding, 32 tokens/request. Measured 2026-03-29.
+Concurrent requests, greedy decoding, 100 tokens/request. Measured 2026-03-29.
 
-| Concurrent (N) | rvLLM (tok/s) | vLLM 0.11.0 (tok/s) | Ratio |
-|---:|---:|---:|---|
-| 1 | 218 | 225 | 0.97x |
-| 2 | 466 | 443 | **1.05x** |
-| 4 | 825 | 842 | 0.98x |
-| 8 | 1,774 | 1,703 | **1.04x** |
-| 16 | 3,303 | 2,981 | **1.11x** |
-| 32 | **6,385** | 5,405 | **1.18x** |
-| 48 | 6,594 | 6,416 | **1.03x** |
-| 64+ | -- | scales to 15,414 (N=1024) | N>48 WIP |
+| N | tok/s | Status |
+|---:|---:|---|
+| 1 | 197 | graph replay |
+| 2 | 506 | graph replay |
+| 4 | 976 | graph replay |
+| 8 | 1,905 | graph replay |
+| 16 | 3,564 | graph replay |
+| 32 | 5,714 | graph replay |
+| 64 | 10,016 | graph replay |
+| 128 | **12,673** | graph replay |
+| 256 | WIP | stabilizing |
 
 | Metric | rvLLM | Python vLLM |
 |---|---|---|
@@ -37,7 +38,7 @@ Head-to-head on the same hardware, same model, greedy decoding, 32 tokens/reques
 | Binary size | 16 MB | ~500 MB |
 | CPU memory | 348 MB | ~1 GB |
 
-rvLLM matches or beats Python vLLM from N=1 through N=48. vLLM scales further at N>64 due to mature continuous batching. Closing this gap is the active priority. See [docs/update-log.md](docs/update-log.md) for the full optimization history.
+Near-linear scaling from N=1 to N=128. N=256 is the active stabilization target. See [docs/arch.md](docs/arch.md) for the full forward pass trace and [docs/update-log.md](docs/update-log.md) for optimization history.
 
 ### CPU Component Benchmarks (sampling, logit processing)
 

@@ -47,28 +47,28 @@ pub struct GpuSamplerResult {
     pub top_logprobs: Vec<(TokenId, f32)>,
 }
 
-/// Per-layer weights stored as CudaSlice<f32> on GPU.
+/// Per-layer weights stored as CudaSlice<f16> on GPU.
 struct LayerWeights {
-    input_layernorm: CudaSlice<f32>,
-    post_attention_layernorm: CudaSlice<f32>,
-    q_proj_weight: CudaSlice<f32>,
-    q_proj_bias: Option<CudaSlice<f32>>,
-    k_proj_weight: CudaSlice<f32>,
-    k_proj_bias: Option<CudaSlice<f32>>,
-    v_proj_weight: CudaSlice<f32>,
-    v_proj_bias: Option<CudaSlice<f32>>,
-    o_proj_weight: CudaSlice<f32>,
-    gate_proj_weight: CudaSlice<f32>,
-    up_proj_weight: CudaSlice<f32>,
-    down_proj_weight: CudaSlice<f32>,
+    input_layernorm: CudaSlice<half::f16>,
+    post_attention_layernorm: CudaSlice<half::f16>,
+    q_proj_weight: CudaSlice<half::f16>,
+    q_proj_bias: Option<CudaSlice<half::f16>>,
+    k_proj_weight: CudaSlice<half::f16>,
+    k_proj_bias: Option<CudaSlice<half::f16>>,
+    v_proj_weight: CudaSlice<half::f16>,
+    v_proj_bias: Option<CudaSlice<half::f16>>,
+    o_proj_weight: CudaSlice<half::f16>,
+    gate_proj_weight: CudaSlice<half::f16>,
+    up_proj_weight: CudaSlice<half::f16>,
+    down_proj_weight: CudaSlice<half::f16>,
 }
 
-/// All model weights on GPU.
+/// All model weights on GPU (f16).
 struct GpuModelWeights {
-    embed_tokens: CudaSlice<f32>,
+    embed_tokens: CudaSlice<half::f16>,
     layers: Vec<LayerWeights>,
-    norm_weight: CudaSlice<f32>,
-    lm_head_weight: Option<CudaSlice<f32>>, // None if tie_word_embeddings
+    norm_weight: CudaSlice<half::f16>,
+    lm_head_weight: Option<CudaSlice<half::f16>>, // None if tie_word_embeddings
     tie_word_embeddings: bool,
 }
 
@@ -329,11 +329,9 @@ pub struct GpuWorker {
     use_fp8_kv: bool,
     guided_states: HashMap<u64, GuidedDecodingState>,
     vocab_table: Option<VocabTable>,
-    /// Raw weight map preserved for deferred GpuModelRunner construction.
+    /// Raw f16 weight map preserved for deferred GpuModelRunner construction.
     #[cfg(feature = "cuda")]
-    raw_weight_map: Option<HashMap<String, CudaSlice<f32>>>,
-    #[cfg(feature = "cuda")]
-    raw_weight_map_f16: Option<HashMap<String, CudaSlice<half::f16>>>,
+    raw_weight_map: Option<HashMap<String, CudaSlice<half::f16>>>,
     /// GPU-resident model runner (full forward pass on GPU, no CPU attention fallback).
     /// Constructed in init_cache() once cache geometry is known.
     #[cfg(feature = "cuda")]
@@ -454,8 +452,6 @@ impl GpuWorker {
             #[cfg(feature = "cuda")]
             raw_weight_map: None,
             #[cfg(feature = "cuda")]
-            raw_weight_map_f16: None,
-            #[cfg(feature = "cuda")]
             gpu_model_runner: None,
             graph_runner,
             forward_count: 0,
@@ -478,93 +474,19 @@ impl GpuWorker {
     pub fn load_weights(&mut self, model_path: &Path) -> Result<()> {
         info!(device_id = self.device_id, path = %model_path.display(), "loading weights to GPU");
 
-        let all_weights_full =
+        let all_weights_f16 =
             rvllm_model_loader::gpu_loader::load_weights_to_gpu(model_path, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("weight loading failed: {e}")))?;
 
-        info!("loaded {} weight tensors to GPU", all_weights_full.len());
+        info!("loaded {} weight tensors to GPU (f16)", all_weights_f16.len());
 
         #[cfg(feature = "cuda")]
         {
-            // Save f32 weight map for GpuModelRunner
-            self.raw_weight_map = Some(all_weights_full.clone());
-
-            // Load f16 weights for hgemm path when dtype is half
-            if self.config.dtype.is_half() {
-                info!("loading f16 weights for hgemm path");
-                let f16_weights = rvllm_model_loader::gpu_loader::load_weights_to_gpu_f16(
-                    model_path,
-                    &self.stream,
-                )
-                .map_err(|e| LLMError::GpuError(format!("f16 weight loading failed: {e}")))?;
-                info!("loaded {} f16 weight tensors", f16_weights.len());
-                self.raw_weight_map_f16 = Some(f16_weights);
-            }
+            self.raw_weight_map = Some(all_weights_f16.clone());
         }
 
-        let mut all_weights = all_weights_full;
-
-        let tie = !all_weights.contains_key("lm_head.weight");
-        info!(tie_word_embeddings = tie, "building model weight structure");
-
-        let embed_tokens = all_weights
-            .remove("model.embed_tokens.weight")
-            .ok_or_else(|| LLMError::ModelError("missing model.embed_tokens.weight".into()))?;
-
-        let norm_weight = all_weights
-            .remove("model.norm.weight")
-            .ok_or_else(|| LLMError::ModelError("missing model.norm.weight".into()))?;
-
-        let lm_head_weight = all_weights.remove("lm_head.weight");
-
-        let num_layers = self.config.num_layers;
-        let mut layers = Vec::with_capacity(num_layers);
-
-        for i in 0..num_layers {
-            let p = format!("model.layers.{}", i);
-            layers.push(LayerWeights {
-                input_layernorm: all_weights
-                    .remove(&format!("{p}.input_layernorm.weight"))
-                    .ok_or_else(|| LLMError::ModelError(format!("missing weight")))?,
-                post_attention_layernorm: all_weights
-                    .remove(&format!("{p}.post_attention_layernorm.weight"))
-                    .ok_or_else(|| LLMError::ModelError(format!("missing weight")))?,
-                q_proj_weight: all_weights
-                    .remove(&format!("{p}.self_attn.q_proj.weight"))
-                    .ok_or_else(|| LLMError::ModelError(format!("missing weight")))?,
-                q_proj_bias: all_weights.remove(&format!("{p}.self_attn.q_proj.bias")),
-                k_proj_weight: all_weights
-                    .remove(&format!("{p}.self_attn.k_proj.weight"))
-                    .ok_or_else(|| LLMError::ModelError(format!("missing weight")))?,
-                k_proj_bias: all_weights.remove(&format!("{p}.self_attn.k_proj.bias")),
-                v_proj_weight: all_weights
-                    .remove(&format!("{p}.self_attn.v_proj.weight"))
-                    .ok_or_else(|| LLMError::ModelError(format!("missing weight")))?,
-                v_proj_bias: all_weights.remove(&format!("{p}.self_attn.v_proj.bias")),
-                o_proj_weight: all_weights
-                    .remove(&format!("{p}.self_attn.o_proj.weight"))
-                    .ok_or_else(|| LLMError::ModelError(format!("missing weight")))?,
-                gate_proj_weight: all_weights
-                    .remove(&format!("{p}.mlp.gate_proj.weight"))
-                    .ok_or_else(|| LLMError::ModelError(format!("missing weight")))?,
-                up_proj_weight: all_weights
-                    .remove(&format!("{p}.mlp.up_proj.weight"))
-                    .ok_or_else(|| LLMError::ModelError(format!("missing weight")))?,
-                down_proj_weight: all_weights
-                    .remove(&format!("{p}.mlp.down_proj.weight"))
-                    .ok_or_else(|| LLMError::ModelError(format!("missing weight")))?,
-            });
-
-            debug!(layer = i, "loaded layer weights");
-        }
-
-        self.model_weights = Some(GpuModelWeights {
-            embed_tokens,
-            layers,
-            norm_weight,
-            lm_head_weight,
-            tie_word_embeddings: tie,
-        });
+        // Weights are stored only in raw_weight_map for GpuModelRunner.
+        // No local GpuModelWeights copy needed (CPU forward path removed).
 
         // Init RoPE tables
         let rope_theta = self.config.rope_theta;
@@ -626,15 +548,7 @@ impl GpuWorker {
             let raw_map = self.raw_weight_map.take().ok_or_else(|| {
                 LLMError::GpuError("raw weight map not available -- call load_weights first".into())
             })?;
-            let mut loader_weights = LoaderWeights::new(raw_map, HashMap::new());
-
-            // Insert f16 weights for hgemm path
-            if let Some(f16_map) = self.raw_weight_map_f16.take() {
-                for (name, slice) in f16_map {
-                    loader_weights.insert_f16(name, slice, vec![]);
-                }
-                info!("inserted f16 weights into model weight container");
-            }
+            let loader_weights = LoaderWeights::new(raw_map, HashMap::new());
 
             let block_size = self.config.block_size;
             let cache = rvllm_kv_cache::engine_cuda::CudaCacheEngine::new(
@@ -672,9 +586,6 @@ impl GpuWorker {
                 self.stream.clone(),
             )?;
 
-            // Always use f16 forward path. f32 path removed.
-            runner.enable_fp16();
-            info!("FP16 inference enabled (always)");
             if let Err(e) = runner.fuse_weights() {
                 warn!("weight fusion failed: {e} -- f16 unfused path");
             }
@@ -700,25 +611,34 @@ impl GpuWorker {
     /// Search for compiled PTX directory from build output.
     #[cfg(feature = "cuda")]
     fn find_ptx_dir() -> Option<std::path::PathBuf> {
-        for base in &[
-            "/root/vllm-rs/target/release/build",
-            "/root/vllm-rs/target/debug/build",
+        // Check env var first
+        if let Ok(dir) = std::env::var("RVLLM_PTX_DIR") {
+            let p = std::path::PathBuf::from(&dir);
+            if p.exists() {
+                info!(dir, "found PTX dir from RVLLM_PTX_DIR");
+                return Some(p);
+            }
+        }
+        // Check common locations
+        for dir in &[
+            "./target/ptx",
+            "/root/rvllm/target/ptx",
             "./target/release/build",
             "./target/debug/build",
         ] {
-            if let Ok(entries) = std::fs::read_dir(base) {
+            let p = std::path::PathBuf::from(dir);
+            if p.join("embedding_gather_f16.ptx").exists() {
+                info!(dir, "found PTX dir");
+                return Some(p);
+            }
+            // Also check build output subdirs
+            if let Ok(entries) = std::fs::read_dir(&p) {
                 for entry in entries.flatten() {
                     let ptx_path = entry.path().join("out/ptx");
-                    if ptx_path.join("rotary_embedding.ptx").exists() {
+                    if ptx_path.join("embedding_gather_f16.ptx").exists() {
                         return Some(ptx_path);
                     }
                 }
-            }
-        }
-        if let Ok(dir) = std::env::var("RVLLM_PTX_DIR") {
-            let p = std::path::PathBuf::from(dir);
-            if p.exists() {
-                return Some(p);
             }
         }
         None
@@ -1061,7 +981,29 @@ impl GpuWorker {
             return self.raw_gpu_forward_ex(model_input, greedy_only);
         }
 
-        // Raw forward. Graphs disabled pending proper CUDA driver compat fix.
+        #[cfg(feature = "cuda")]
+        {
+            let batch = model_input.num_tokens();
+
+            // 1. Exact graph replay (hot path: ~0.1ms)
+            if self.graph_runner.has_graph_for_exact(batch) {
+                return self.gpu_forward_ex_graphed_exact(model_input, batch, greedy_only);
+            }
+
+            // 2. Past warmup? Capture a graph for this batch size
+            if self.forward_count > Self::GRAPH_WARMUP_CALLS
+                && !self.graph_runner.was_capture_attempted(batch)
+            {
+                match self.try_capture_graph_exact(model_input, batch, greedy_only) {
+                    Ok(output) => return Ok(output),
+                    Err(e) => {
+                        warn!(batch, "graph capture failed, raw forward: {e}");
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback: raw forward (pre-warmup or capture failure)
         self.raw_gpu_forward_ex(model_input, greedy_only)
     }
 
@@ -1321,536 +1263,10 @@ impl GpuWorker {
         self.raw_gpu_forward_ex(padded_input, greedy_only)
     }
 
-    /// Legacy CPU forward pass (kept for comparison benchmarks only, not used in production).
+    /// Legacy CPU forward pass removed -- f16 only, use GpuModelRunner.
     #[allow(dead_code)]
-    fn gpu_forward_cpu_attention(&mut self, model_input: &ModelInput) -> Result<Vec<f32>> {
-        if self.model_weights.is_none() {
-            return Err(LLMError::GpuError("model not loaded".into()));
-        }
-
-        let token_ids = &model_input.token_ids;
-        let position_ids = &model_input.position_ids;
-        let is_prefill = model_input.is_prefill;
-
-        let num_tokens = token_ids.len();
-        let hidden_size = self.config.hidden_size;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = self.config.head_dim;
-        let intermediate_size = self.config.intermediate_size;
-
-        // On prefill, reset the KV cache (new sequence)
-        if is_prefill {
-            if let Some(ref mut cache) = self.kv_cache {
-                cache.clear();
-            }
-            if let Some(ref mut cache) = self.fp8_kv_cache {
-                cache.clear();
-            }
-        }
-
-        let cache_len = self
-            .kv_cache
-            .as_ref()
-            .map(|c| c.len())
-            .or_else(|| self.fp8_kv_cache.as_ref().map(|c| c.len()))
-            .unwrap_or(0);
-        debug!(
-            num_tokens,
-            is_prefill, "gpu_forward_cpu_attention: cache_len={}", cache_len
-        );
-
-        // 1. Embedding lookup (GPU gather when kernel available, else CPU fallback)
-        let mut hidden = {
-            let w = self.model_weights.as_ref().unwrap();
-            self.embedding_lookup_gpu(token_ids, &w.embed_tokens, hidden_size)?
-        };
-
-        // 2. Transformer layers
-        let num_layers = self.model_weights.as_ref().unwrap().layers.len();
-        for layer_idx in 0..num_layers {
-            hidden = self.transformer_layer_cached(
-                &hidden,
-                layer_idx,
-                position_ids,
-                is_prefill,
-                num_tokens,
-                hidden_size,
-                num_heads,
-                num_kv_heads,
-                head_dim,
-                intermediate_size,
-            )?;
-        }
-
-        // Advance KV cache position after all layers processed
-        if let Some(ref mut cache) = self.kv_cache {
-            cache.advance(num_tokens);
-        }
-        if let Some(ref mut cache) = self.fp8_kv_cache {
-            cache.advance(num_tokens);
-        }
-
-        // 3. Final RMS norm
-        {
-            let w = self.model_weights.as_ref().unwrap();
-            hidden = self.rms_norm_gpu(&hidden, &w.norm_weight, num_tokens, hidden_size)?;
-        }
-
-        // 4. LM head
-        let vocab_size = self.vocab_size;
-        let mut logits_gpu = self
-            .stream
-            .alloc_zeros::<f32>(num_tokens * vocab_size)
-            .map_err(gpu_err)?;
-
-        {
-            let w = self.model_weights.as_ref().unwrap();
-            let lm_head = if w.tie_word_embeddings {
-                &w.embed_tokens
-            } else {
-                w.lm_head_weight.as_ref().unwrap()
-            };
-
-            self.cublas
-                .sgemm(
-                    num_tokens,
-                    vocab_size,
-                    hidden_size,
-                    1.0,
-                    &hidden,
-                    lm_head,
-                    0.0,
-                    &mut logits_gpu,
-                )
-                .map_err(|e| LLMError::GpuError(format!("lm_head sgemm: {e}")))?;
-        }
-
-        let logits = self.stream.clone_dtoh(&logits_gpu).map_err(gpu_err)?;
-
-        Ok(logits)
-    }
-
-    /// Embedding lookup via GPU gather kernel when available.
-    ///
-    /// With the kernel: uploads only token_ids (~batch*4 bytes), gathers on GPU.
-    /// Without: falls back to CPU gather (DtoH full embed table).
-    fn embedding_lookup_gpu(
-        &self,
-        token_ids: &[TokenId],
-        embed_weight: &CudaSlice<f32>,
-        hidden_size: usize,
-    ) -> Result<CudaSlice<f32>> {
-        let num_tokens = token_ids.len();
-        let output_len = num_tokens * hidden_size;
-
-        // CPU gather (legacy path -- production uses GpuModelRunner)
-        let embed_host = self.stream.clone_dtoh(embed_weight).map_err(gpu_err)?;
-        let mut result = vec![0.0f32; output_len];
-        for (i, &tid) in token_ids.iter().enumerate() {
-            let tid = tid as usize;
-            if tid * hidden_size + hidden_size <= embed_host.len() {
-                let src = &embed_host[tid * hidden_size..(tid + 1) * hidden_size];
-                result[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(src);
-            }
-        }
-        self.stream.clone_htod(&result).map_err(gpu_err)
-    }
-
-    /// Transformer layer with RoPE and KV cache.
-    fn transformer_layer_cached(
-        &mut self,
-        hidden: &CudaSlice<f32>,
-        layer_idx: usize,
-        position_ids: &[u32],
-        is_prefill: bool,
-        num_tokens: usize,
-        hidden_size: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        intermediate_size: usize,
-    ) -> Result<CudaSlice<f32>> {
-        // We need to borrow weights immutably but also use &mut self for cache.
-        // Work around by extracting what we need from weights first.
-        let weights = self
-            .model_weights
-            .as_ref()
-            .ok_or_else(|| LLMError::GpuError("model not loaded".into()))?;
-        let layer = &weights.layers[layer_idx];
-
-        // 1. RMS Norm
-        let normed = self.rms_norm_gpu(hidden, &layer.input_layernorm, num_tokens, hidden_size)?;
-
-        // 2. QKV projections on GPU
-        let q_dim = num_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-
-        let mut q_gpu = self
-            .stream
-            .alloc_zeros::<f32>(num_tokens * q_dim)
-            .map_err(gpu_err)?;
-        let mut k_gpu = self
-            .stream
-            .alloc_zeros::<f32>(num_tokens * kv_dim)
-            .map_err(gpu_err)?;
-        let mut v_gpu = self
-            .stream
-            .alloc_zeros::<f32>(num_tokens * kv_dim)
-            .map_err(gpu_err)?;
-
-        self.cublas.sgemm(
-            num_tokens,
-            q_dim,
-            hidden_size,
-            1.0,
-            &normed,
-            &layer.q_proj_weight,
-            0.0,
-            &mut q_gpu,
-        )?;
-        self.cublas.sgemm(
-            num_tokens,
-            kv_dim,
-            hidden_size,
-            1.0,
-            &normed,
-            &layer.k_proj_weight,
-            0.0,
-            &mut k_gpu,
-        )?;
-        self.cublas.sgemm(
-            num_tokens,
-            kv_dim,
-            hidden_size,
-            1.0,
-            &normed,
-            &layer.v_proj_weight,
-            0.0,
-            &mut v_gpu,
-        )?;
-
-        // Add biases if present
-        if let Some(ref qb) = layer.q_proj_bias {
-            self.add_bias_gpu(&mut q_gpu, qb, num_tokens, q_dim)?;
-        }
-        if let Some(ref kb) = layer.k_proj_bias {
-            self.add_bias_gpu(&mut k_gpu, kb, num_tokens, kv_dim)?;
-        }
-        if let Some(ref vb) = layer.v_proj_bias {
-            self.add_bias_gpu(&mut v_gpu, vb, num_tokens, kv_dim)?;
-        }
-
-        // 3. Download Q, K, V to CPU for RoPE + attention
-        let mut q_host = self.stream.clone_dtoh(&q_gpu).map_err(gpu_err)?;
-        let mut k_host = self.stream.clone_dtoh(&k_gpu).map_err(gpu_err)?;
-        let v_host = self.stream.clone_dtoh(&v_gpu).map_err(gpu_err)?;
-
-        // 4. Apply RoPE to Q and K
-        if let Some(ref rope) = self.rope_table {
-            rope.apply(&mut q_host, position_ids, num_tokens, num_heads, head_dim);
-            rope.apply(
-                &mut k_host,
-                position_ids,
-                num_tokens,
-                num_kv_heads,
-                head_dim,
-            );
-        }
-
-        // 5. KV Cache: append new K,V, then use full cache for attention
-        let (full_k, full_v, total_kv_len) = if let Some(ref mut cache) = self.fp8_kv_cache {
-            cache.append_quantized(layer_idx, &k_host, &v_host);
-            let total_len = cache.len() + num_tokens;
-            let full_k = cache.keys_dequantized(layer_idx);
-            let full_v = cache.values_dequantized(layer_idx);
-            (full_k, full_v, total_len)
-        } else if let Some(ref mut cache) = self.kv_cache {
-            cache.append(layer_idx, &k_host, &v_host);
-            let total_len = cache.len() + num_tokens;
-            let full_k = cache.keys(layer_idx).to_vec();
-            let full_v = cache.values(layer_idx).to_vec();
-            (full_k, full_v, total_len)
-        } else {
-            (k_host, v_host, num_tokens)
-        };
-
-        // 6. Attention (CPU)
-        let attn_output = self.cached_attention(
-            &q_host,
-            &full_k,
-            &full_v,
-            num_tokens,
-            total_kv_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            is_prefill,
-        );
-
-        let attn_out_gpu = self.stream.clone_htod(&attn_output).map_err(gpu_err)?;
-
-        // Need to re-borrow weights after mutable kv_cache borrow is done
-        let weights = self.model_weights.as_ref().unwrap();
-        let layer = &weights.layers[layer_idx];
-
-        // 7. Output projection
-        let mut attn_proj = self
-            .stream
-            .alloc_zeros::<f32>(num_tokens * hidden_size)
-            .map_err(gpu_err)?;
-        self.cublas.sgemm(
-            num_tokens,
-            hidden_size,
-            q_dim,
-            1.0,
-            &attn_out_gpu,
-            &layer.o_proj_weight,
-            0.0,
-            &mut attn_proj,
-        )?;
-
-        // 8+9. Fused residual add + post-attention RMS Norm (one kernel when available)
-        let (normed2, residual1) = self.fused_residual_rmsnorm_gpu(
-            hidden,
-            &attn_proj,
-            &layer.post_attention_layernorm,
-            num_tokens,
-            hidden_size,
-        )?;
-
-        // 10. MLP: SiLU-gated
-        let mut gate = self
-            .stream
-            .alloc_zeros::<f32>(num_tokens * intermediate_size)
-            .map_err(gpu_err)?;
-        let mut up = self
-            .stream
-            .alloc_zeros::<f32>(num_tokens * intermediate_size)
-            .map_err(gpu_err)?;
-
-        self.cublas.sgemm(
-            num_tokens,
-            intermediate_size,
-            hidden_size,
-            1.0,
-            &normed2,
-            &layer.gate_proj_weight,
-            0.0,
-            &mut gate,
-        )?;
-        self.cublas.sgemm(
-            num_tokens,
-            intermediate_size,
-            hidden_size,
-            1.0,
-            &normed2,
-            &layer.up_proj_weight,
-            0.0,
-            &mut up,
-        )?;
-
-        let mlp_activated = self.fused_silu_mul_gpu(&gate, &up, num_tokens * intermediate_size)?;
-
-        let mut down = self
-            .stream
-            .alloc_zeros::<f32>(num_tokens * hidden_size)
-            .map_err(gpu_err)?;
-        self.cublas.sgemm(
-            num_tokens,
-            hidden_size,
-            intermediate_size,
-            1.0,
-            &mlp_activated,
-            &layer.down_proj_weight,
-            0.0,
-            &mut down,
-        )?;
-
-        // 11. Residual add
-        let result = self.add_tensors_gpu(&residual1, &down, num_tokens * hidden_size)?;
-
-        Ok(result)
-    }
-
-    /// Multi-head attention with GQA support, operating on CPU host buffers.
-    /// Handles both prefill (causal mask over all Q positions) and decode (Q is just new tokens,
-    /// K/V includes full cache).
-    fn cached_attention(
-        &self,
-        q: &[f32], // [num_q_tokens, num_heads * head_dim]
-        k: &[f32], // [total_kv_len, num_kv_heads * head_dim]
-        v: &[f32], // [total_kv_len, num_kv_heads * head_dim]
-        num_q_tokens: usize,
-        total_kv_len: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        is_prefill: bool,
-    ) -> Vec<f32> {
-        let q_stride = num_heads * head_dim;
-        let kv_stride = num_kv_heads * head_dim;
-        let heads_per_kv = num_heads / num_kv_heads;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-
-        let mut output = vec![0.0f32; num_q_tokens * q_stride];
-
-        for h in 0..num_heads {
-            let kv_h = h / heads_per_kv;
-
-            for qi in 0..num_q_tokens {
-                // Causal masking:
-                // During prefill, Q position qi can attend to K positions 0..=qi
-                // During decode, Q is the new token(s), can attend to all KV (full cache)
-                let max_ki = if is_prefill {
-                    // qi-th query token corresponds to the qi-th position in the sequence
-                    qi
-                } else {
-                    // decode: Q tokens can attend to everything in cache
-                    total_kv_len - 1
-                };
-
-                let attend_len = max_ki + 1;
-
-                // Compute attention scores
-                let mut max_score = f32::NEG_INFINITY;
-                let mut scores = Vec::with_capacity(attend_len);
-
-                for ki in 0..attend_len {
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        let q_val = q[qi * q_stride + h * head_dim + d];
-                        let k_val = k[ki * kv_stride + kv_h * head_dim + d];
-                        dot += q_val * k_val;
-                    }
-                    let score = dot * scale;
-                    if score > max_score {
-                        max_score = score;
-                    }
-                    scores.push(score);
-                }
-
-                // Softmax
-                let mut sum = 0.0f32;
-                for s in scores.iter_mut() {
-                    *s = (*s - max_score).exp();
-                    sum += *s;
-                }
-                if sum > 0.0 {
-                    let inv_sum = 1.0 / sum;
-                    for s in scores.iter_mut() {
-                        *s *= inv_sum;
-                    }
-                }
-
-                // Weighted sum of values
-                for d in 0..head_dim {
-                    let mut val = 0.0f32;
-                    for (ki, &weight) in scores.iter().enumerate() {
-                        val += weight * v[ki * kv_stride + kv_h * head_dim + d];
-                    }
-                    output[qi * q_stride + h * head_dim + d] = val;
-                }
-            }
-        }
-
-        output
-    }
-
-    /// RMS Norm via GPU kernel (no CPU round-trip when kernel is loaded).
-    fn rms_norm_gpu(
-        &self,
-        hidden: &CudaSlice<f32>,
-        weight: &CudaSlice<f32>,
-        num_tokens: usize,
-        hidden_size: usize,
-    ) -> Result<CudaSlice<f32>> {
-        let n = num_tokens * hidden_size;
-        let eps = self.rms_norm_eps;
-
-        // CPU RMS norm (legacy path -- production uses GpuModelRunner)
-        let h = self.stream.clone_dtoh(hidden).map_err(gpu_err)?;
-        let w = self.stream.clone_dtoh(weight).map_err(gpu_err)?;
-        let mut out = vec![0.0f32; n];
-        for t in 0..num_tokens {
-            let row = &h[t * hidden_size..(t + 1) * hidden_size];
-            let ss: f32 = row.iter().map(|x| x * x).sum();
-            let inv_rms = (ss / hidden_size as f32 + eps).sqrt().recip();
-            for d in 0..hidden_size {
-                out[t * hidden_size + d] = row[d] * inv_rms * w.get(d).copied().unwrap_or(1.0);
-            }
-        }
-        self.stream.clone_htod(&out).map_err(gpu_err)
-    }
-
-    /// Add bias to a tensor via GPU kernel (no CPU round-trip when kernel is loaded).
-    fn add_bias_gpu(
-        &self,
-        tensor: &mut CudaSlice<f32>,
-        bias: &CudaSlice<f32>,
-        num_tokens: usize,
-        dim: usize,
-    ) -> Result<()> {
-        // CPU bias add (legacy path -- production uses GpuModelRunner)
-        let mut data = self.stream.clone_dtoh(tensor).map_err(gpu_err)?;
-        let b = self.stream.clone_dtoh(bias).map_err(gpu_err)?;
-        for t in 0..num_tokens {
-            for d in 0..dim.min(b.len()) {
-                data[t * dim + d] += b[d];
-            }
-        }
-        *tensor = self.stream.clone_htod(&data).map_err(gpu_err)?;
-        Ok(())
-    }
-
-    /// Element-wise add two tensors via GPU kernel (no CPU round-trip when kernel is loaded).
-    fn add_tensors_gpu(
-        &self,
-        a: &CudaSlice<f32>,
-        b: &CudaSlice<f32>,
-        len: usize,
-    ) -> Result<CudaSlice<f32>> {
-        // CPU add (legacy path -- production uses GpuModelRunner)
-        let a_h = self.stream.clone_dtoh(a).map_err(gpu_err)?;
-        let b_h = self.stream.clone_dtoh(b).map_err(gpu_err)?;
-        let out: Vec<f32> = a_h.iter().zip(b_h.iter()).map(|(x, y)| x + y).collect();
-        self.stream.clone_htod(&out).map_err(gpu_err)
-    }
-
-    /// Fused SiLU(gate) * up via GPU kernel (no CPU round-trip when kernel is loaded).
-    fn fused_silu_mul_gpu(
-        &self,
-        gate: &CudaSlice<f32>,
-        up: &CudaSlice<f32>,
-        len: usize,
-    ) -> Result<CudaSlice<f32>> {
-        // CPU fused SiLU * mul (legacy path -- production uses GpuModelRunner)
-        let g = self.stream.clone_dtoh(gate).map_err(gpu_err)?;
-        let u = self.stream.clone_dtoh(up).map_err(gpu_err)?;
-        let out: Vec<f32> = g
-            .iter()
-            .zip(u.iter())
-            .map(|(&gv, &uv)| (gv / (1.0 + (-gv).exp())) * uv)
-            .collect();
-        self.stream.clone_htod(&out).map_err(gpu_err)
-    }
-
-    /// Fused residual add + RMS norm. When the fused kernel is loaded, this
-    /// executes in a single kernel launch. Otherwise falls back to separate ops.
-    fn fused_residual_rmsnorm_gpu(
-        &self,
-        input: &CudaSlice<f32>,
-        add: &CudaSlice<f32>,
-        weight: &CudaSlice<f32>,
-        num_tokens: usize,
-        hidden_size: usize,
-    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>)> {
-        let n = num_tokens * hidden_size;
-
-        // Separate add + norm (legacy path -- production uses GpuModelRunner)
-        let residual = self.add_tensors_gpu(input, add, n)?;
-        let normed = self.rms_norm_gpu(&residual, weight, num_tokens, hidden_size)?;
-        Ok((normed, residual))
+    fn gpu_forward_cpu_attention(&mut self, _model_input: &ModelInput) -> Result<Vec<f32>> {
+        Err(LLMError::GpuError("CPU attention path removed -- use GPU runner (f16)".into()))
     }
 
     /// Sample tokens from the flat logits buffer.
@@ -2054,7 +1470,7 @@ fn worker_config_from_engine(
         pipeline_parallel_size: config.parallel.pipeline_parallel_size,
         architecture: "llama".into(),
         dtype: config.model.dtype.clone(),
-        rope_theta: 10000.0,
+        rms_norm_eps: 1e-5, rope_theta: 10000.0,
         kv_cache_dtype: config.cache.kv_cache_dtype.clone(),
         enable_prefix_caching: config.cache.enable_prefix_caching,
         partial_rotary_factor: 1.0,

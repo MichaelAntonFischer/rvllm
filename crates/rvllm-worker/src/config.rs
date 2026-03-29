@@ -37,6 +37,8 @@ pub struct WorkerConfig {
     pub architecture: String,
     /// Data type for model weights and compute.
     pub dtype: Dtype,
+    /// RMSNorm epsilon. Must match model config exactly (e.g. 1e-6 for Qwen, 1e-5 for Llama).
+    pub rms_norm_eps: f32,
     /// RoPE theta parameter.
     pub rope_theta: f32,
     /// Fraction of head_dim that gets RoPE (Phi: 0.5, others: 1.0).
@@ -65,6 +67,7 @@ impl WorkerConfig {
             intermediate_size: self.intermediate_size,
             vocab_size: self.vocab_size,
             max_position: self.max_model_len,
+            rms_norm_eps: self.rms_norm_eps,
             dtype: self.dtype,
             architecture: self.architecture.clone(),
             rope_theta: self.rope_theta,

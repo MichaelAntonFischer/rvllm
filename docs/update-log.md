@@ -199,3 +199,56 @@ The 4.1ms per token is the **hardware efficiency floor** for Qwen2.5-1.5B on A10
 | 9-agent kernel | **4.21ms** | **236** | **5,123** | Cross-layer fusion, memset elimination, pool tuning |
 
 **Total: 130 -> 236 tok/s (1.82x). 41% of theoretical peak (574 tok/s).**
+
+---
+
+## 2026-03-29: Pure f16 Refactor + Coherence Fix + H100 Benchmarks
+
+### Pure f16 (removed all f32 from data path)
+- `GpuModelWeights`: single `HashMap<String, CudaSlice<f16>>` (was dual f32+f16)
+- `gpu_loader`: loads all weights as f16 (bf16/f32 on disk -> f16 at load time)
+- `GpuLayerWeights`: all fields `CudaSlice<f16>` (was mixed f32 norms + f16 projections)
+- `GpuLayerInput`: `hidden_states: &CudaSlice<f16>` (was f32 with optional f16)
+- Runner: `embed_tokens`, `final_norm_weight`, `lm_head_weight` all f16
+- `fuse_weights()`: pure DtoD concat, no f32->f16 GPU casts
+- Removed ~800 lines of f32 helper methods, ~530 lines of dead CPU attention path
+- f32 only remains for: RoPE cos/sin tables, rms_norm epsilon scalar, LM head logits (argmax boundary)
+
+### Coherence bug found and fixed
+**Root cause:** Fused QKV GEMM outputs `[T, QKV_dim]` where each row is `[Q_t, K_t, V_t]` interleaved. The split code assumed `[all_Q | all_K | all_V]` layout. For T=1 (decode) these are identical. For T>1 (prefill) the split mixes Q/K/V from different tokens, corrupting the KV cache. Every subsequent decode step read garbage.
+**Fix:** Use individual projections (3 GEMMs) for prefill (T>1), fused single GEMM for decode (T=1). Same fix applied to fused gate+up and QKV bias.
+**Also fixed:** `rms_norm_eps` was hardcoded 1e-5 instead of reading from model config (Qwen2.5 uses 1e-6). Now threaded from `config.json` -> `HfModelConfig` -> `WorkerConfig` -> `ModelRunnerConfig` -> each layer.
+
+### CUDA graphs re-enabled
+- Exact batch size match (no padding)
+- Pre-allocated metadata + output GPU buffers at max size (256 seqs) so graph-captured pointers never go stale on buffer reallocation
+- Warmup (3 forward calls) before capture
+- Fallback to raw forward on capture failure
+
+### H100 80GB benchmarks (Qwen2.5-1.5B, f16, greedy, 100 tok/req)
+
+| N | tok/s |
+|---|---|
+| 1 | 197 |
+| 2 | 506 |
+| 4 | 976 |
+| 8 | 1,905 |
+| 16 | 3,564 |
+| 32 | 5,714 |
+| 64 | 10,016 |
+| 128 | **12,673** |
+
+Near-linear scaling. Zero failures N=1 through N=128. All via CUDA graph replay.
+
+---
+
+## Full History
+
+| Phase | GPU | N=1 | Peak | Key change |
+|---|---|---|---|---|
+| Phase 4 | A100 | 130 | 3,467 (N=32) | CUDA graph capture |
+| Phase 5 | A100 | 174 | 4,276 (N=32) | 10-agent swarm |
+| Full f16 | A100 | 200 | - | Zero casts |
+| 9-agent kernel | A100 | 236 | 5,123 (N=32) | Cross-layer fusion |
+| GPU thread | A100 | 236 | 6,385 (N=32) | Dedicated OS thread |
+| **Pure f16 + fix** | **H100** | **197** | **12,673 (N=128)** | **Coherence fix, f16 refactor, graph pre-alloc** |

@@ -375,6 +375,7 @@ mod inner {
                 pipeline_parallel_size: config.parallel.pipeline_parallel_size,
                 architecture: hf_config.architecture.clone(),
                 dtype: config.model.dtype,
+                rms_norm_eps: hf_config.rms_norm_eps,
                 rope_theta: hf_config.rope_theta,
                 partial_rotary_factor: hf_config.partial_rotary_factor,
                 attn_logit_softcapping: hf_config.attn_logit_softcapping,
