@@ -1716,8 +1716,8 @@ mod cuda_impl {
         }
 
         pub fn disable_fp16(&mut self) {
-            self.use_fp16 = false;
-            tracing::warn!("GpuModelRunner: fp16 mode disabled, using f32 forward");
+            // f32 forward path removed. f16 is always on.
+            tracing::warn!("disable_fp16 called but f32 path removed -- staying f16");
         }
 
         /// Drop f32 weights to free GPU memory when f16 path is active.
