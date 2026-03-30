@@ -1344,7 +1344,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::types::responses::{
-        ResponseInputMessage, ResponseInputTextPart, ResponseSpecificToolChoice,
+        ResponseInputContentPart, ResponseInputMessage, ResponseSpecificToolChoice,
     };
     use crate::{build_router, AppState};
     use axum_test::TestServer;
@@ -1576,7 +1576,7 @@ mod tests {
         let items = vec![
             StoredConversationItem::Input(ResponseInputItem::Message(ResponseInputMessage::new(
                 "user",
-                vec![ResponseInputTextPart::new("Weather?")],
+                vec![ResponseInputContentPart::input_text("Weather?")],
             ))),
             StoredConversationItem::Output(ResponseOutputItem::FunctionCall(
                 ResponseFunctionCallItem::completed(
@@ -1701,6 +1701,70 @@ mod tests {
         let body = response.json::<serde_json::Value>();
         assert_eq!(body["object"], "response");
         assert_eq!(body["reasoning"]["effort"], "low");
+    }
+
+    #[tokio::test]
+    async fn create_response_route_accepts_supported_include_values() {
+        let (server, _) = make_server(vec![vec![request_output("done", true)]]);
+
+        let response = server
+            .post("/v1/responses")
+            .json(&serde_json::json!({
+                "model": "test",
+                "input": "Hello",
+                "include": [
+                    "message.output_text.logprobs",
+                    "reasoning.encrypted_content"
+                ]
+            }))
+            .await;
+
+        response.assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn create_response_route_accepts_input_image_parts() {
+        let (server, engine) = make_server(vec![vec![request_output("done", true)]]);
+
+        let response = server
+            .post("/v1/responses")
+            .json(&serde_json::json!({
+                "model": "test",
+                "input": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Look at "
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/cat.png",
+                            "detail": "low"
+                        }
+                    ]
+                }],
+                "store": true
+            }))
+            .await;
+
+        response.assert_status_ok();
+        let body = response.json::<serde_json::Value>();
+        let response_id = body["id"].as_str().unwrap();
+
+        let items = server
+            .get(&format!("/v1/responses/{response_id}/input_items"))
+            .await;
+        items.assert_status_ok();
+        let items = items.json::<serde_json::Value>();
+        assert_eq!(items["data"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            items["data"][0]["content"][1]["image_url"],
+            "https://example.com/cat.png"
+        );
+
+        let prompts = engine.prompts();
+        assert!(prompts[0].contains("[input_image url=https://example.com/cat.png detail=low]"));
     }
 
     #[tokio::test]

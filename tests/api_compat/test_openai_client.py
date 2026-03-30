@@ -294,6 +294,44 @@ class TestResponses:
         data = r.json()
         assert data["reasoning"]["effort"] == "low"
 
+    def test_response_accepts_include_values(self):
+        """Responses accept documented include values without a validation error"""
+        r = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "input": "Hello",
+            "include": [
+                "message.output_text.logprobs",
+                "reasoning.encrypted_content",
+            ],
+        })
+        assert r.status_code == 200
+
+    def test_response_accepts_input_image_parts(self):
+        """Responses accept input_image parts and preserve them in stored input items"""
+        r = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Look at "},
+                    {
+                        "type": "input_image",
+                        "image_url": "https://example.com/cat.png",
+                        "detail": "low",
+                    },
+                ],
+            }],
+            "store": True,
+        })
+        assert r.status_code == 200
+        response_id = r.json()["id"]
+
+        items = requests.get(f"{BASE_URL}/v1/responses/{response_id}/input_items")
+        assert items.status_code == 200
+        data = items.json()
+        assert data["data"][0]["content"][1]["type"] == "input_image"
+        assert data["data"][0]["content"][1]["image_url"] == "https://example.com/cat.png"
+
     def test_response_rejects_built_in_tools(self):
         """Built-in Responses tools are still rejected explicitly"""
         r = requests.post(f"{BASE_URL}/v1/responses", json={
