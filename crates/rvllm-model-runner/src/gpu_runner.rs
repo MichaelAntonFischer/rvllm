@@ -31,7 +31,7 @@ mod cuda_impl {
 
     use std::cell::Cell;
 
-    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaView, DevicePtrMut, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaView, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::{debug, info, trace};
 
@@ -170,6 +170,8 @@ mod cuda_impl {
         fp8_fused_gate_up_scale: Vec<CudaSlice<half::f16>>,
         fp8_down_proj: Vec<CudaSlice<u8>>,
         fp8_down_proj_scale: Vec<CudaSlice<half::f16>>,
+        /// FP8 input scratch buffer for cublasLt FP8 GEMM (reused across layers).
+        fp8_input_scratch: Option<CudaSlice<u8>>,
         /// Pre-allocated scratch buffers for the forward pass.
         f16_scratch: Option<F16LayerScratch>,
     }
@@ -301,6 +303,7 @@ mod cuda_impl {
                 fp8_fused_gate_up_scale: Vec::new(),
                 fp8_down_proj: Vec::new(),
                 fp8_down_proj_scale: Vec::new(),
+                fp8_input_scratch: None,
                 f16_scratch: None,
             })
         }
@@ -457,6 +460,10 @@ mod cuda_impl {
                     self.fp8_down_proj.push(fp8);
                     self.fp8_down_proj_scale.push(sc);
                 }
+                // Allocate FP8 input scratch (max of all input dimensions)
+                let max_k = *[hidden, q_dim, intermediate].iter().max().unwrap();
+                self.fp8_input_scratch = Some(unsafe { self.stream.alloc::<u8>(max_k) }
+                    .map_err(|e| LLMError::GpuError(format!("fp8 input scratch: {e}")))?);
                 info!(num_layers, "FP8 weight quantization complete (all projections)");
             }
 
@@ -587,6 +594,11 @@ mod cuda_impl {
                     seq_start_pos: packed_buf.slice(offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos),
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
+                    fp8_input_scratch_ptr: self.fp8_input_scratch.as_ref().map_or(0u64, |s| {
+                        let (p, _) = DevicePtr::device_ptr(s, &self.stream);
+                        p
+                    }),
+                    fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
                 let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
@@ -842,6 +854,11 @@ mod cuda_impl {
                     seq_start_pos: packed_buf.slice(offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos),
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
+                    fp8_input_scratch_ptr: self.fp8_input_scratch.as_ref().map_or(0u64, |s| {
+                        let (p, _) = DevicePtr::device_ptr(s, &self.stream);
+                        p
+                    }),
+                    fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
                 let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
@@ -985,6 +1002,11 @@ mod cuda_impl {
                     seq_start_pos: packed_buf.slice(offsets.seq_start_pos..offsets.seq_start_pos + offsets.num_seq_start_pos),
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
+                    fp8_input_scratch_ptr: self.fp8_input_scratch.as_ref().map_or(0u64, |s| {
+                        let (p, _) = DevicePtr::device_ptr(s, &self.stream);
+                        p
+                    }),
+                    fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
                 let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;

@@ -149,6 +149,7 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
             "splitk_f32_to_f16_kernel",
         ],
     ),
+    ("cast_f16_to_fp8", &["cast_f16_to_fp8_kernel"]),
     ("gemv_f16", &["gemv_f16_kernel", "gemv_batched_f16_kernel"]),
     ("rms_norm", &["rms_norm_kernel"]),
     ("rms_norm_f16", &["rms_norm_f16_kernel"]),

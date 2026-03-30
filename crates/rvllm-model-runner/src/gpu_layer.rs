@@ -6,7 +6,7 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtrMut, DeviceSlice, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::{info, trace};
 
@@ -95,6 +95,12 @@ mod inner {
         pub rope_cos: &'a CudaSlice<f32>,
         /// RoPE sin table on GPU: [max_position, head_dim/2].
         pub rope_sin: &'a CudaSlice<f32>,
+        /// FP8 input scratch buffer raw device pointer for cublasLt FP8 GEMM.
+        /// Written by cast kernel, read by cublasLt -- ordering via CUDA stream.
+        /// Raw pointer avoids Rust borrow checker issues with mutable GPU buffers.
+        pub fp8_input_scratch_ptr: u64,
+        /// Length of the FP8 scratch buffer (max input dimension).
+        pub fp8_input_scratch_len: usize,
     }
 
     /// One complete GPU transformer layer.
@@ -179,7 +185,168 @@ mod inner {
             let k_end = q_end + num_tokens * kv_dim;
 
             // ================================================================
-            // T=1 DECODE: maximally fused path
+            // T=1 DECODE: cublasLt FP8 path (when FP8 weights available)
+            // Separate norm + cublasLt FP8 GEMM. More kernels but 1.5-1.9x faster GEMMs.
+            // ================================================================
+            #[cfg(feature = "cublaslt")]
+            if num_tokens == 1 && !input.is_prefill && input.fp8_input_scratch_ptr != 0 {
+                if let (
+                    Some(qkv_fp8), Some(_qkv_sc),
+                    Some(gu_fp8), Some(_gu_sc),
+                    Some(down_fp8), Some(_down_sc),
+                    Some(lt_ops),
+                    Ok(cast_fn),
+                ) = (
+                    weights.fused_qkv_fp8, weights.fused_qkv_fp8_scale,
+                    weights.fused_gate_up_fp8, weights.fused_gate_up_fp8_scale,
+                    weights.down_proj_fp8, weights.down_proj_fp8_scale,
+                    lt,
+                    self.loader.get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel"),
+                ) {
+                    let fp8_scratch_ptr = input.fp8_input_scratch_ptr;
+                    // Step 1: RMSNorm (separate from GEMV)
+                    let (normed, residual_ref) = if let Some(prev_mlp) = prev_mlp_out {
+                        let (n, r) = Self::fused_residual_rmsnorm_f16(
+                            &self.stream, &self.loader, hidden_f16, prev_mlp, norm_w,
+                            cfg.rms_norm_eps, 1, hidden)?;
+                        (n, r)
+                    } else {
+                        let n = Self::rms_norm_f16(&self.stream, &self.loader, hidden_f16, norm_w, cfg.rms_norm_eps, 1, hidden)?;
+                        (n, hidden_f16.clone())
+                    };
+
+                    // Step 2: Cast normed -> FP8, then cublasLt FP8 GEMM for QKV
+                    let cast_cfg = LaunchConfig { grid_dim: (((hidden + 255) / 256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                    let (normed_ptr, _ng) = DevicePtr::device_ptr(&normed, &self.stream);
+                    let (qkv_w_ptr, _qg) = DevicePtr::device_ptr(qkv_fp8, &self.stream);
+                    unsafe {
+                        self.stream.launch_builder(&cast_fn)
+                            .arg(&fp8_scratch_ptr).arg(&normed_ptr).arg(&(hidden as i32))
+                            .launch(cast_cfg)
+                            .map_err(|e| LLMError::GpuError(format!("cast f16->fp8 qkv: {e}")))?;
+                    }
+                    let mut qkv = unsafe { self.stream.alloc::<f16>(qkv_dim) }
+                        .map_err(|e| LLMError::GpuError(format!("fp8 qkv alloc: {e}")))?;
+                    let (qkv_out_ptr, _qog) = DevicePtrMut::device_ptr_mut(&mut qkv, &self.stream);
+                    lt_ops.fp8_gemm_a_bt_raw(1, qkv_dim, hidden, fp8_scratch_ptr, qkv_w_ptr, qkv_out_ptr)?;
+
+                    // Step 3: QKV bias
+                    if let Some(bias) = weights.qkv_bias {
+                        let mut qkv_view = qkv.slice_mut(..qkv_dim);
+                        Self::add_bias_f16_view(&self.stream, &self.loader, &mut qkv_view, bias, 1, qkv_dim)?;
+                    }
+
+                    // Step 4: RoPE + cache write
+                    if let Ok(ref fk) = self.loader.get_func("fused_rope_cache", "fused_rope_cache_f16_kernel") {
+                        let (mut q_part, mut kv_rest) = qkv.split_at_mut(q_dim);
+                        let (mut k_part, v_part) = kv_rest.split_at_mut(kv_dim);
+                        let v_view = v_part.slice(..kv_dim);
+                        let half_dim = head_dim / 2;
+                        let grid_y = num_heads.max(num_kv_heads) as u32;
+                        unsafe {
+                            self.stream.launch_builder(fk)
+                                .arg(&mut q_part).arg(&mut k_part).arg(&v_view)
+                                .arg(input.key_cache).arg(input.value_cache)
+                                .arg(input.rope_cos).arg(input.rope_sin)
+                                .arg(&input.positions).arg(&input.slot_mapping)
+                                .arg(&(num_tokens as i32)).arg(&(num_heads as i32))
+                                .arg(&(num_kv_heads as i32)).arg(&(head_dim as i32))
+                                .launch(LaunchConfig { grid_dim: (num_tokens as u32, grid_y, 1), block_dim: (half_dim.min(1024) as u32, 1, 1), shared_mem_bytes: 0 })
+                                .map_err(|e| LLMError::GpuError(format!("fused rope+cache: {e}")))?;
+                        }
+                    } else {
+                        {
+                            let (mut q_part, mut kv_part) = qkv.split_at_mut(q_dim);
+                            let mut k_view = kv_part.slice_mut(..kv_dim);
+                            Self::apply_rotary_embedding_f16_views(
+                                &self.stream, &self.loader, &mut q_part, &mut k_view,
+                                &input.positions, input.rope_cos, input.rope_sin,
+                                num_tokens, num_heads, num_kv_heads, head_dim)?;
+                        }
+                        {
+                            let k_view = qkv.slice(q_dim..q_dim + kv_dim);
+                            let v_view = qkv.slice(q_dim + kv_dim..);
+                            Self::cache_write_f16_views(
+                                &self.stream, &self.loader, &k_view, &v_view,
+                                input.key_cache, input.value_cache, &input.slot_mapping,
+                                num_tokens, num_kv_heads, head_dim)?;
+                        }
+                    }
+
+                    // Step 5: Attention
+                    let attn_out = Self::decode_attention_f16io(
+                        &self.stream, &self.loader,
+                        &qkv.slice(..q_dim),
+                        input.key_cache, input.value_cache,
+                        &input.block_tables, &input.context_lens,
+                        1, input.num_seqs, num_heads, num_kv_heads, head_dim,
+                        input.max_context_len, input.block_size)?;
+
+                    // Step 6: O-proj via cublasLt FP8
+                    let (attn_ptr, _ag) = DevicePtr::device_ptr(&attn_out, &self.stream);
+                    let (o_w_ptr, _og) = DevicePtr::device_ptr(weights.o_proj_fp8.unwrap(), &self.stream);
+                    let cast_q_cfg = LaunchConfig { grid_dim: (((q_dim + 255) / 256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                    unsafe {
+                        self.stream.launch_builder(&cast_fn)
+                            .arg(&fp8_scratch_ptr).arg(&attn_ptr).arg(&(q_dim as i32))
+                            .launch(cast_q_cfg)
+                            .map_err(|e| LLMError::GpuError(format!("cast f16->fp8 oproj: {e}")))?;
+                    }
+                    let mut attn_proj = unsafe { self.stream.alloc::<f16>(hidden) }
+                        .map_err(|e| LLMError::GpuError(format!("fp8 oproj alloc: {e}")))?;
+                    let (ap_ptr, _apg) = DevicePtrMut::device_ptr_mut(&mut attn_proj, &self.stream);
+                    lt_ops.fp8_gemm_a_bt_raw(1, hidden, q_dim, fp8_scratch_ptr, o_w_ptr, ap_ptr)?;
+
+                    // Step 7: Post-attn norm
+                    drop((_ag, _og, _apg));
+                    let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
+                        &self.stream, &self.loader, &residual_ref, &attn_proj, post_norm_w,
+                        cfg.rms_norm_eps, 1, hidden)?;
+
+                    // Step 8: GateUp via cublasLt FP8
+                    let gate_up_dim = intermediate * 2;
+                    let (n2_ptr, _n2g) = DevicePtr::device_ptr(&normed2, &self.stream);
+                    let (gu_w_ptr, _gug) = DevicePtr::device_ptr(gu_fp8, &self.stream);
+                    unsafe {
+                        self.stream.launch_builder(&cast_fn)
+                            .arg(&fp8_scratch_ptr).arg(&n2_ptr).arg(&(hidden as i32))
+                            .launch(cast_cfg)
+                            .map_err(|e| LLMError::GpuError(format!("cast f16->fp8 gateup: {e}")))?;
+                    }
+                    let mut gate_up = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
+                        .map_err(|e| LLMError::GpuError(format!("fp8 gateup alloc: {e}")))?;
+                    let (gu_out_ptr, _guog) = DevicePtrMut::device_ptr_mut(&mut gate_up, &self.stream);
+                    lt_ops.fp8_gemm_a_bt_raw(1, gate_up_dim, hidden, fp8_scratch_ptr, gu_w_ptr, gu_out_ptr)?;
+
+                    // Step 9: SiLU * mul
+                    drop((_n2g, _gug, _guog));
+                    let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up, intermediate)?;
+
+                    // Step 10: Down via cublasLt FP8
+                    let (fa_ptr, _fag) = DevicePtr::device_ptr(&fused_act, &self.stream);
+                    let (d_w_ptr, _dg) = DevicePtr::device_ptr(down_fp8, &self.stream);
+                    let cast_inter_cfg = LaunchConfig { grid_dim: (((intermediate + 255) / 256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+                    unsafe {
+                        self.stream.launch_builder(&cast_fn)
+                            .arg(&fp8_scratch_ptr).arg(&fa_ptr).arg(&(intermediate as i32))
+                            .launch(cast_inter_cfg)
+                            .map_err(|e| LLMError::GpuError(format!("cast f16->fp8 down: {e}")))?;
+                    }
+                    let mut mlp_out = unsafe { self.stream.alloc::<f16>(hidden) }
+                        .map_err(|e| LLMError::GpuError(format!("fp8 down alloc: {e}")))?;
+                    let mlp_ptr = {
+                        let (p, _g) = DevicePtrMut::device_ptr_mut(&mut mlp_out, &self.stream);
+                        p
+                    };
+                    lt_ops.fp8_gemm_a_bt_raw(1, hidden, intermediate, fp8_scratch_ptr, d_w_ptr, mlp_ptr)?;
+                    drop((_fag, _dg));
+
+                    return Ok((residual, mlp_out));
+                }
+            }
+
+            // ================================================================
+            // T=1 DECODE: maximally fused path (f16 fallback)
             // Fuses: add+norm+QKV GEMV, bias, RoPE+cache_write, attn, add+norm+gateup, silu+down
             // ================================================================
             if num_tokens == 1 && !input.is_prefill {
@@ -804,8 +971,8 @@ mod inner {
             Ok(output)
         }
 
-        /// hgemm dispatch: uses cublasLt for M<=32 (split-K), falls back to standard cuBLAS.
-        /// GEMM dispatch: custom GEMV for M=1, cublasLt for M<=32, cuBLAS for larger.
+        /// hgemm dispatch: FP8 cublasLt for M=1 when FP8 weights available,
+        /// custom GEMV for M=1, cublasLt for M<=32, cuBLAS for larger.
         fn hgemm_dispatch(
             stream: &Arc<CudaStream>,
             blas: &CublasHandle,
@@ -817,13 +984,54 @@ mod inner {
             k: usize,
             loader: &KernelLoader,
         ) -> Result<CudaSlice<f16>> {
+            Self::hgemm_dispatch_fp8(stream, blas, lt, input, weight, m, n, k, loader, None, None)
+        }
+
+        /// hgemm dispatch with optional FP8 weights. When fp8_weight + fp8_input_scratch
+        /// are provided and M=1, uses cublasLt FP8 GEMM (1.5-1.9x faster on H100).
+        fn hgemm_dispatch_fp8(
+            stream: &Arc<CudaStream>,
+            blas: &CublasHandle,
+            lt: Option<&crate::CublasLtRef>,
+            input: &CudaSlice<f16>,
+            weight: &CudaSlice<f16>,
+            m: usize,
+            n: usize,
+            k: usize,
+            loader: &KernelLoader,
+            fp8_weight: Option<&CudaSlice<u8>>,
+            fp8_input_scratch: Option<&mut CudaSlice<u8>>,
+        ) -> Result<CudaSlice<f16>> {
             let mut output = unsafe { stream.alloc::<f16>(m * n) }
                 .map_err(|e| LLMError::GpuError(format!("hgemm_dispatch: {e}")))?;
 
-            // M=1: custom GEMV kernel (vectorized half2, warp shuffle reduction)
-            // TMA async-prefetch GEMV available but only benefits when weight > L2 cache.
-            // For standalone O-proj GEMV (~25MB), L2 handles it. TMA will be wired into
-            // the fused kernels where it matters (gateup 135MB weight reads).
+            // M=1 + FP8 weights: cast input f16->fp8, then cublasLt FP8 GEMM
+            #[cfg(feature = "cublaslt")]
+            if m == 1 {
+                if let (Some(w_fp8), Some(in_scratch), Some(lt_ops)) = (fp8_weight, fp8_input_scratch, lt) {
+                    // Cast input f16 -> fp8
+                    if let Ok(cast_kernel) = loader.get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel") {
+                        let cast_cfg = LaunchConfig {
+                            grid_dim: (((k + 255) / 256) as u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        unsafe {
+                            stream.launch_builder(&cast_kernel)
+                                .arg(in_scratch)
+                                .arg(input)
+                                .arg(&(k as i32))
+                                .launch(cast_cfg)
+                                .map_err(|e| LLMError::GpuError(format!("cast f16->fp8: {e}")))?;
+                        }
+                        // FP8 GEMM via cublasLt raw API
+                        lt_ops.fp8_gemm_a_bt(m, n, k, in_scratch, w_fp8, &mut output)?;
+                        return Ok(output);
+                    }
+                }
+            }
+
+            // M=1: custom GEMV kernel (f16 fallback)
             if m == 1 {
                 if let Ok(kernel) = loader.get_func("gemv_f16", "gemv_f16_kernel") {
                     let cfg = LaunchConfig {
@@ -843,7 +1051,6 @@ mod inner {
                     }
                     return Ok(output);
                 }
-                // Fallthrough to cuBLAS if kernel not loaded
             }
 
             #[cfg(feature = "cublaslt")]
