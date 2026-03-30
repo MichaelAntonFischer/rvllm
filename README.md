@@ -172,15 +172,31 @@ rvllm serve --model Qwen/Qwen2.5-7B --dtype half
 
 # Benchmark (direct engine, no HTTP)
 rvllm benchmark --model Qwen/Qwen2.5-7B --dtype half --n "1,4,16,64,128"
+```
 
-# With FP8 weights (halves VRAM for weights)
+### Optional Features
+
+**FP8 Weights** (`RVLLM_FP8_WEIGHTS=1`): Quantizes all projection weights to FP8 E4M3 at startup. Halves weight memory bandwidth for single-stream decode (M=1 GEMV). Does NOT improve batched throughput -- at M>=8, f16 tensor cores already saturate compute and the f16->fp8 cast adds overhead. Use for latency-sensitive single-user workloads, not high-concurrency serving.
+
+```bash
 RVLLM_FP8_WEIGHTS=1 rvllm serve --model Qwen/Qwen2.5-7B --dtype half
+```
 
-# With FP8 KV cache (doubles max sequences)
+**FP8 KV Cache** (`RVLLM_FP8_KV=1`): Stores KV cache in FP8, doubling the number of concurrent sequences at the cost of minor precision loss.
+
+```bash
 RVLLM_FP8_KV=1 rvllm serve --model Qwen/Qwen2.5-7B --dtype half
+```
 
-# With speculative decoding (faster N=1 latency)
-RVLLM_SPECULATIVE=1 rvllm serve --model Qwen/Qwen2.5-7B --dtype half
+**Speculative Decoding** (`RVLLM_SPECULATIVE=1`): Self-draft speculative decoding using the first N layers of the target model as a draft. Produces multiple tokens per step when the draft is accepted. Primarily beneficial for large models (70B+) where single-token decode latency is high enough that the draft+verify overhead is worthwhile. For 7B models, the acceptance rate with self-draft at 1/4 depth is too low to overcome the verify prefill cost. Requires a proper draft KV cache for production use (currently experimental).
+
+```bash
+# 70B+ models (recommended)
+RVLLM_SPECULATIVE=1 RVLLM_SPECULATIVE_K=3 rvllm serve --model meta-llama/Llama-3-70B --dtype half
+
+# Configuration
+RVLLM_SPECULATIVE_K=5          # draft tokens per step (default: 3)
+RVLLM_SPECULATIVE_DRAFT_LAYERS=8  # layers for self-draft (default: total_layers/4)
 ```
 
 ## Benchmark Methodology
