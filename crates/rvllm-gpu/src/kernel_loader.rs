@@ -105,6 +105,18 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         "fused_silu_down",
         &["fused_silu_down_f16_kernel", "fused_silu_down_bias_f16_kernel"],
     ),
+    (
+        "fused_add_norm_qkv_gemv",
+        &["fused_cute_add_norm_qkv_gemv", "fused_cute_norm_qkv_gemv"],
+    ),
+    (
+        "fused_add_norm_gateup_gemv",
+        &["fused_cute_add_norm_gateup_gemv"],
+    ),
+    (
+        "fused_silu_down_gemv",
+        &["fused_cute_silu_down_gemv"],
+    ),
     ("gemv_f16", &["gemv_f16_kernel", "gemv_batched_f16_kernel"]),
     ("rms_norm", &["rms_norm_kernel"]),
     ("rms_norm_f16", &["rms_norm_f16_kernel"]),

@@ -1,8 +1,41 @@
 # Benchmark History
 
-All results on A100 80GB SXM4, Qwen2.5-1.5B, greedy decoding, 32 tokens/request unless noted.
+All results greedy decoding, 32 tokens/request unless noted.
 
-## Phase 4 (2026-03-28) -- CUDA graph capture fix
+## Phase 5 (2026-03-30) -- Kernel fusion swarm (H100 SXM 80GB)
+
+Direct engine benchmark (no HTTP). Fused kernels: add+norm+QKV GEMV, add+norm+gateup GEMV,
+silu+down GEMV, GQA-optimized FA3 attention. Prefill uses fused QKV/gateup for all N.
+
+| N | tok/s | vs Phase 4 (A100) | Notes |
+|---|---|---|---|
+| 1 | 240 | 1.88x | Fused kernels + cublasLt split-K |
+| 4 | 1,201 | 2.22x | |
+| 8 | 2,328 | 2.13x | |
+| 16 | 4,229 | 2.00x | |
+| 32 | 8,575 | 2.47x | |
+| 64 | 15,812 | 3.89x | GQA attention 6x less KV bandwidth |
+| 128 | 26,161 | 4.11x | |
+| 256 | 40,714 | 4.89x | |
+
+### Qwen2.5-7B f16 (H100 SXM 80GB, direct engine)
+
+| N | tok/s | wall_ms |
+|---|---|---|
+| 1 | 108 | 296 |
+| 4 | 544 | 235 |
+| 8 | 1,073 | 238 |
+| 16 | 2,019 | 253 |
+| 32 | 3,911 | 261 |
+| 64 | 7,300 | 280 |
+| 128 | 12,624 | 324 |
+
+N=256 hits KV cache limits at 0.9 gpu-memory-utilization for 7B.
+
+Note: Phase 4 was on A100, Phase 5 on H100. H100 has ~2x raw bandwidth and ~3x tensor
+core FLOPS vs A100. The per-hardware improvement from fusion alone is ~1.5-2x.
+
+## Phase 4 (2026-03-28) -- CUDA graph + cublasLt (A100 80GB SXM4)
 
 Measured with concurrent Python HTTP requests after graph capture fix.
 

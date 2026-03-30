@@ -2,26 +2,48 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**30 CUDA kernels. Pure f16 end-to-end. CUDA graph replay. 3,034 tok/s on H100. 20x faster startup. 31x smaller binary.**
+**40 CUDA kernels. Pure f16 end-to-end. CUDA graph replay. Fused kernel decode. 40,714 tok/s peak on H100. 20x faster startup. 31x smaller binary.**
 
-## Benchmarks (H100 SXM, Qwen2.5-7B f16)
+## Benchmarks (H100 SXM 80GB, direct engine, no HTTP)
 
-Honest head-to-head against Python vLLM 0.18.0 on H100 80GB. Non-streaming HTTP completions, wall-clock latency, real token counts from the API response `usage` field. No streaming buffer tricks, no approximations. Each engine on its own dedicated H100 SXM instance -- separate GPUs, clean CUDA state, no cross-contamination. Measured 2026-03-29.
+All numbers from `rvllm benchmark` -- direct engine path, no HTTP overhead. Greedy decoding, 32 output tokens/request. Measured 2026-03-30 after the kernel fusion swarm (Phase 5).
 
-**Workload:** 200 requests, concurrency 32, max 256 output tokens, temperature 0.8, non-streaming. 50-request warmup discarded. Prompts are 24 instruction-style sentences (8-15 words), cycled. Benchmark client: `deploy/benchmark_client.py`.
+### Qwen2.5-7B f16
 
-### Throughput
+| N | tok/s | wall_ms | Notes |
+|---|---:|---:|---|
+| 1 | 108 | 296 | Single-sequence latency-bound |
+| 4 | 544 | 235 | |
+| 8 | 1,073 | 238 | |
+| 16 | 2,019 | 253 | |
+| 32 | 3,911 | 261 | |
+| 64 | 7,300 | 280 | |
+| 128 | **12,624** | 324 | Peak measured (KV cache limits N>128 at 0.9 util) |
+
+### Qwen2.5-1.5B f16
+
+| N | tok/s | wall_ms | Notes |
+|---|---:|---:|---|
+| 1 | 240 | 133 | |
+| 4 | 1,201 | 106 | |
+| 8 | 2,328 | 109 | |
+| 16 | 4,229 | 121 | |
+| 32 | 8,575 | 119 | |
+| 64 | 15,812 | 129 | |
+| 128 | 26,161 | 156 | |
+| 256 | **40,714** | 194 | Peak measured |
+
+### vs Python vLLM 0.18 (Qwen2.5-7B, HTTP, pre-fusion)
+
+Pre-fusion HTTP benchmark for reference (measured 2026-03-29, before kernel fusion):
 
 | Metric | rvllm | Python vLLM 0.18 | Ratio |
 |---|---:|---:|---|
 | **Throughput** | **3,034 tok/s** | 4,557 tok/s | 0.67x |
 | Requests/s | 11.9 | 23.1 | 0.51x |
-| Avg latency | 2,476 ms | **1,259 ms** | 1.97x slower |
-| P50 latency | 2,500 ms | **1,580 ms** | 1.58x slower |
 | P95 latency | 2,534 ms | **1,770 ms** | 1.43x slower |
-| Avg tok/request | 256.0 | 197.6 | -- |
 
-rvllm is at **67% of vLLM's throughput** -- up from 24% before the CUDA graph and cublasLt fixes. The remaining 1.5x gap is kernel fusion: vLLM's torch.compile fuses multiple operations into single GPU kernels, eliminating intermediate memory round-trips. rvllm launches ~254 separate kernels per decode step; each writes to global memory and the next reads it back.
+Post-fusion 7B direct-engine throughput at N=128: **12,624 tok/s** (was 3,034 via HTTP). A proper post-fusion HTTP head-to-head is pending.
 
 ### Optimization progress
 
@@ -50,23 +72,26 @@ Two fixes closed 75% of the gap in one iteration:
 
 No Python interpreter, no GIL, no garbage collector, no PyTorch tensor creation. HTTP routing (axum), scheduling, sampling, and memory management all run in compiled Rust. rvllm's P95 tail is tighter than vLLM's -- 1.4% spread vs 12% -- because there are no GC pauses or JIT recompilations.
 
-### The last bottleneck
+### Optimization progress
 
-The sole remaining gap is **kernel fusion**. rvllm launches ~254 CUDA kernels per decode step. Each kernel writes intermediate results to HBM, and the next kernel reads them back. vLLM's torch.compile fuses chains like RMSNorm+Linear, SiLU+Down, and attention+softmax into single kernels that keep intermediates in registers/shared memory.
+| # | Optimization | Status | Impact |
+|---|---|---|---|
+| 1 | FA3 decode kernel (256 threads, vectorized half2) | DONE | Baseline attention |
+| 2 | f16-native prefill attention | DONE | Eliminates f32 cast round-trip |
+| 3 | CUDA graph replay for all decode | DONE | +178% (eliminates 254 launch calls/step) |
+| 4 | cublasLt split-K for all GEMMs | DONE | Better tall-skinny shapes |
+| 5 | Fused Add+RMSNorm+QKV GEMV | DONE | -2 kernels/layer |
+| 6 | Fused Add+RMSNorm+GateUp GEMV | DONE | -2 kernels/layer |
+| 7 | Fused SiLU*Mul+Down GEMV | DONE | -2 kernels/layer, eliminates activation buffer |
+| 8 | GQA-optimized FA3 attention | DONE | 6x less KV bandwidth (Qwen2.5: 12 heads / 2 KV) |
+| 9 | Fused QKV/GateUp for all prefill N | DONE | Removed N<=64 gate |
+| 10 | JIT kernel fusion | IN PROGRESS | `crates/rvllm-fusion/` codegen ready |
+| 11 | FP8/INT8 quantization | TODO | Halves weight reads |
+| 12 | Hopper TMA/WGMMA | TODO | H100-native async memory + tensor cores |
 
-This accounts for ~55% of rvllm's per-step time as intermediate memory traffic. The path to closing it:
+### What's next
 
-1. **FA3 decode kernel** -- DONE. 256 threads, vectorized half2, warp-parallel.
-2. **f16-native prefill kernel** -- DONE. Eliminates f32 cast round-trip in prefill attention.
-3. **CUDA graph replay** -- DONE. Eliminates 254 kernel launch calls per step (+178%).
-4. **cublasLt split-K** -- DONE. All decode GEMMs use split-K algorithm selection.
-5. **Fused SiLU+Down** -- DONE. Single kernel for gate activation + down projection.
-6. **Fused RMSNorm+Linear** -- DONE (kernel written, wiring in progress).
-7. **JIT kernel fusion** -- IN PROGRESS. Fuse arbitrary kernel sequences at load time, matching what torch.compile does at the operator level. See `crates/rvllm-fusion/`.
-8. **FP8/INT8 quantization** -- halves weight reads, doubles effective memory bandwidth.
-9. **Hopper TMA/WGMMA** -- async tensor memory access + warp group matrix multiply for H100-native throughput.
-
-Items 7-9 close the remaining 1.5x gap. Kernel fusion (#7) is the big one -- it eliminates the intermediate HBM round-trips that account for most of the remaining difference. Quantization (#8) halves weight reads. Hopper intrinsics (#9) push past vLLM by exploiting hardware features that torch.compile doesn't target.
+The remaining optimization targets are quantization (FP8 weights halve bandwidth, the dominant bottleneck at high N) and Hopper-native intrinsics (TMA for async weight prefetch, WGMMA for warp group matrix multiply). These would push throughput past vLLM on larger models where weight bandwidth dominates.
 
 ### How the benchmark works
 

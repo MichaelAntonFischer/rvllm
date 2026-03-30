@@ -177,7 +177,7 @@ mod inner {
                 let (mut qkv, residual_ref) = if let Some(prev_mlp) = prev_mlp_out {
                     // Try fused add+norm+QKV GEMV (3-way: add + norm + projection)
                     let fused_qkv_w = weights.fused_qkv.unwrap_or(weights.q_proj);
-                    if let Ok(ref fk) = self.loader.get_func("fused_add_norm_qkv", "fused_cute_add_norm_qkv_gemv") {
+                    if let Ok(ref fk) = self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_add_norm_qkv_gemv") {
                         let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
                             .map_err(|e| LLMError::GpuError(format!("fused qkv alloc: {e}")))?;
                         let mut residual_out = unsafe { self.stream.alloc::<f16>(hidden) }
@@ -208,7 +208,7 @@ mod inner {
                 } else {
                     // First layer: norm+QKV GEMV
                     let fused_qkv_w = weights.fused_qkv.unwrap_or(weights.q_proj);
-                    if let Ok(ref fk) = self.loader.get_func("fused_norm_qkv", "fused_cute_norm_qkv_gemv") {
+                    if let Ok(ref fk) = self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_norm_qkv_gemv") {
                         let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
                             .map_err(|e| LLMError::GpuError(format!("fused qkv alloc: {e}")))?;
                         let smem = (hidden * 4 + 8 * 4) as u32;
@@ -292,7 +292,7 @@ mod inner {
 
                 // --- Steps 8-10: Fused add+norm+gateup + silu+down (already wired) ---
                 let (residual, mlp_out) = {
-                    let fused_gateup_ok = self.loader.get_func("fused_add_norm_gateup", "fused_cute_add_norm_gateup_gemv").ok();
+                    let fused_gateup_ok = self.loader.get_func("fused_add_norm_gateup_gemv", "fused_cute_add_norm_gateup_gemv").ok();
                     if let Some(ref fk) = fused_gateup_ok {
                         let gate_up_dim = intermediate * 2;
                         let mut gate_up_out = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
@@ -317,7 +317,7 @@ mod inner {
                         let gate = gate_up_out.slice(..intermediate);
                         let up = gate_up_out.slice(intermediate..gate_up_dim);
                         // Fused silu+down GEMV
-                        let mlp = if let Ok(ref sk) = self.loader.get_func("fused_silu_down", "fused_cute_silu_down_gemv") {
+                        let mlp = if let Ok(ref sk) = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv") {
                             let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
                                 .map_err(|e| LLMError::GpuError(format!("fused silu_down alloc: {e}")))?;
                             let sk_smem = (8 * 4) as u32;
@@ -375,11 +375,9 @@ mod inner {
             let residual_ref = fused_residual.as_ref().unwrap_or(hidden_f16);
 
             // 2. QKV projections
-            // For N<=64: fused GEMM + transpose (saves 2 GEMM launches)
-            // For N>64: 3 separate GEMMs into slices (no transpose overhead)
-            let use_fused_qkv = weights.fused_qkv.is_some() && num_tokens <= 64;
-            let mut qkv = if use_fused_qkv {
-                let fused_qkv = weights.fused_qkv.unwrap();
+            // Fused GEMM [N, hidden] x [hidden, qkv_dim]^T + transpose for all N
+            // Fallback: 3 separate GEMMs when fused weight unavailable
+            let mut qkv = if let Some(fused_qkv) = weights.fused_qkv {
                 let qkv_interleaved = Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv, num_tokens, qkv_dim, hidden, &self.loader)?;
                 if let Ok(transpose_fn) = self.loader.get_func("qkv_transpose", "qkv_transpose_f16_kernel") {
                     let mut qkv_transposed = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
@@ -501,10 +499,8 @@ mod inner {
             let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
                 &self.stream, &self.loader, residual_ref, &attn_proj, post_norm_w,
                 cfg.rms_norm_eps, num_tokens, hidden)?;
-            // Gate+up: fused GEMM + interleaved silu_mul for N<=64, separate GEMMs for N>64
-            let use_fused_gateup = weights.fused_gate_up.is_some() && num_tokens <= 64;
-            let fused_act = if use_fused_gateup {
-                let fused_gate_up = weights.fused_gate_up.unwrap();
+            // Gate+up: fused GEMM + interleaved silu_mul for all N when available
+            let fused_act = if let Some(fused_gate_up) = weights.fused_gate_up {
                 let gate_up_dim = intermediate * 2;
                 let gu_interleaved = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fused_gate_up, num_tokens, gate_up_dim, hidden, &self.loader)?;
                 // Direct silu_mul on interleaved layout: 1 kernel, no transpose/copy
@@ -895,6 +891,52 @@ mod inner {
             let p_head_dim = head_dim as i32;
             let p_block_size = block_size as i32;
             let p_max_blocks = (block_tables.len() / num_seqs.max(1)) as i32;
+
+            // GQA-optimized FA3 kernel: one block per KV head, processes all query heads
+            // in the group. Reduces KV cache loads by heads_per_group (e.g. 6x for Qwen2.5-1.5B).
+            // Only used when GQA is active (num_heads != num_kv_heads) and ratio <= 8.
+            let heads_per_group = if num_kv_heads > 0 { num_heads / num_kv_heads } else { 1 };
+            if num_heads != num_kv_heads && heads_per_group <= 8 {
+                if let Ok(gqa_kernel) = loader.get_func("flash_attention_3", "flash_attention_3_decode_gqa_f16io_kernel") {
+                    const GQA_BC: usize = 64;
+                    const GQA_THREADS: u32 = 256;
+                    const GQA_MAX_HPG: usize = 8;
+                    // s_kv[BC*head_dim] + s_scores[MAX_HPG*BC] + s_warp[8]
+                    let smem = (GQA_BC * head_dim + GQA_MAX_HPG * GQA_BC + 8) * std::mem::size_of::<f32>();
+                    let shared_mem_bytes = smem as u32;
+
+                    let p_max_context = max_context_len as i32;
+
+                    let cfg = LaunchConfig {
+                        grid_dim: (num_seqs as u32, num_kv_heads as u32, 1),
+                        block_dim: (GQA_THREADS, 1, 1),
+                        shared_mem_bytes,
+                    };
+
+                    if shared_mem_bytes > 49152 {
+                        gqa_kernel.set_attribute(
+                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            shared_mem_bytes as i32,
+                        ).map_err(|e| LLMError::GpuError(format!("FA3 GQA set max shared mem: {e}")))?;
+                    }
+
+                    unsafe {
+                        stream.launch_builder(&gqa_kernel)
+                            .arg(&mut output)
+                            .arg(q)
+                            .arg(key_cache).arg(value_cache)
+                            .arg(block_tables).arg(context_lens)
+                            .arg(&scale)
+                            .arg(&p_num_heads).arg(&p_num_kv_heads)
+                            .arg(&p_head_dim).arg(&p_block_size)
+                            .arg(&p_max_context)
+                            .arg(&p_max_blocks)
+                            .launch(cfg)
+                            .map_err(|e| LLMError::GpuError(format!("FA3 GQA decode launch: {e}")))?;
+                    }
+                    return Ok(output);
+                }
+            }
 
             // FA3 kernel: 256 threads, vectorized half2 loads, warp-parallel reductions.
             // Shared memory: 33KB (fits in default 48KB, no set_attribute needed).
