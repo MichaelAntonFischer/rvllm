@@ -96,92 +96,6 @@ impl CublasLtOps {
         Ok(())
     }
 
-    /// Row-major HGEMM with a pre-selected autotuned algorithm + workspace.
-    /// C[m,n] = alpha * A[m,k] @ B^T[k,n] + beta * C[m,n]
-    pub fn hgemm_a_bt_with_algo(
-        &self,
-        m: usize,
-        n: usize,
-        k: usize,
-        alpha: f32,
-        a: &CudaSlice<f16>,
-        b: &CudaSlice<f16>,
-        beta: f32,
-        c: &mut CudaSlice<f16>,
-        algo: &lt_sys::cublasLtMatmulAlgo_t,
-        workspace: &CudaSlice<u8>,
-    ) -> Result<()> {
-        use std::ffi::c_void;
-
-        unsafe {
-            let handle = *self.handle.handle();
-
-            // Recreate descriptors (cheap, ~1us)
-            let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
-            let s = lt_sys::cublasLtMatmulDescCreate(
-                &mut desc,
-                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                lt_sys::cudaDataType_t::CUDA_R_32F,
-            );
-            if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                return Err(LLMError::GpuError(format!("hgemm_a_bt_with_algo desc create: {s:?}")));
-            }
-
-            let trans_a = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
-            let trans_b = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
-            lt_sys::cublasLtMatmulDescSetAttribute(
-                desc,
-                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-                &trans_a as *const _ as *const c_void,
-                std::mem::size_of_val(&trans_a),
-            );
-            lt_sys::cublasLtMatmulDescSetAttribute(
-                desc,
-                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-                &trans_b as *const _ as *const c_void,
-                std::mem::size_of_val(&trans_b),
-            );
-
-            let f16_type = lt_sys::cudaDataType_t::CUDA_R_16F;
-            let mut la: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-            let mut lb: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-            let mut lc: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-            lt_sys::cublasLtMatrixLayoutCreate(&mut la, f16_type, k as u64, n as u64, k as i64);
-            lt_sys::cublasLtMatrixLayoutCreate(&mut lb, f16_type, k as u64, m as u64, k as i64);
-            lt_sys::cublasLtMatrixLayoutCreate(&mut lc, f16_type, n as u64, m as u64, n as i64);
-
-            let (b_ptr, _bg) = DevicePtr::device_ptr(b, &self.stream);
-            let (a_ptr, _ag) = DevicePtr::device_ptr(a, &self.stream);
-            let (c_ptr, _cg) = DevicePtrMut::device_ptr_mut(c, &self.stream);
-            let (ws_ptr, _wg) = DevicePtr::device_ptr(workspace, &self.stream);
-            let ws_size = workspace.len();
-
-            let s = lt_sys::cublasLtMatmul(
-                handle,
-                desc,
-                &alpha as *const f32 as *const c_void,
-                b_ptr as *const c_void, la,
-                a_ptr as *const c_void, lb,
-                &beta as *const f32 as *const c_void,
-                c_ptr as *mut c_void, lc,
-                c_ptr as *mut c_void, lc,
-                algo,
-                ws_ptr as *mut c_void, ws_size,
-                self.stream.cu_stream(),
-            );
-
-            lt_sys::cublasLtMatrixLayoutDestroy(la);
-            lt_sys::cublasLtMatrixLayoutDestroy(lb);
-            lt_sys::cublasLtMatrixLayoutDestroy(lc);
-            lt_sys::cublasLtMatmulDescDestroy(desc);
-
-            if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                return Err(LLMError::GpuError(format!("hgemm_a_bt_with_algo matmul: {s:?}")));
-            }
-        }
-        Ok(())
-    }
-
     /// Row-major HGEMM into a view via cublasLt. Accepts any DevicePtr/DevicePtrMut
     /// so callers can pass CudaViewMut (sub-slices of a larger buffer).
     pub fn hgemm_a_bt_into(
@@ -190,10 +104,10 @@ impl CublasLtOps {
         n: usize,
         k: usize,
         alpha: f32,
-        a: &CudaSlice<f16>,
-        b: &CudaSlice<f16>,
+        a: &impl DevicePtr<f16>,
+        b: &impl DevicePtr<f16>,
         beta: f32,
-        c: &mut CudaSlice<f16>,
+        c: &mut impl DevicePtrMut<f16>,
     ) -> Result<()> {
         let cfg = MatmulConfig {
             transa: true,
@@ -283,8 +197,8 @@ impl CublasLtOps {
                 return Err(LLMError::GpuError(format!("fp8 desc create: {s:?}")));
             }
 
-            let trans_a = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
-            let trans_b = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
+            let trans_a = lt_sys::cublasOperation_t::CUBLAS_OP_T;
+            let trans_b = lt_sys::cublasOperation_t::CUBLAS_OP_N;
             lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, &trans_a as *const _ as *const c_void, std::mem::size_of_val(&trans_a));
             lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, &trans_b as *const _ as *const c_void, std::mem::size_of_val(&trans_b));
 

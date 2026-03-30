@@ -35,7 +35,7 @@ rvllm-speculative = { workspace = true, optional = true }
 
 [features]
 default = []
-cuda = ["dep:cudarc", "dep:rvllm-worker", "dep:rvllm-block-manager", "dep:rvllm-speculative", "rvllm-worker?/cuda", "cublaslt"]
+cuda = ["dep:cudarc", "dep:rvllm-worker", "dep:rvllm-block-manager", "dep:rvllm-speculative", "rvllm-worker?/cuda"]
 cublaslt = ["cuda", "rvllm-worker?/cublaslt"]
 
 [dev-dependencies]
