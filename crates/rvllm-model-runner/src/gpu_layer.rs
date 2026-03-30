@@ -392,28 +392,7 @@ mod inner {
                                 .map_err(|e| LLMError::GpuError(format!("fp8 add_norm_qkv: {e}")))?;
                         }
                         (qkv_out, residual_out, false)
-                    // JIT add+norm+QKV (primary f16 path -- no bias, bias added separately)
-                    } else if let Ok(ref fk) = self.loader.get_func("jit_add_norm_qkv", "fused_add_rmsnorm_gemv_3584x4608") {
-                        let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
-                            .map_err(|e| LLMError::GpuError(format!("jit qkv alloc: {e}")))?;
-                        let mut residual_out = unsafe { self.stream.alloc::<f16>(hidden) }
-                            .map_err(|e| LLMError::GpuError(format!("jit residual alloc: {e}")))?;
-                        let smem = (hidden * 4 + 8 * 4) as u32;
-                        if smem > 49152 {
-                            fk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
-                                .map_err(|e| LLMError::GpuError(format!("jit smem attr: {e}")))?;
-                        }
-                        // JIT param order: (out, res_out, input, add, norm_w, proj_w, eps, out_dim, hidden_size)
-                        unsafe {
-                            self.stream.launch_builder(fk)
-                                .arg(&mut qkv_out).arg(&mut residual_out)
-                                .arg(hidden_f16).arg(prev_mlp).arg(norm_w).arg(fused_qkv_w)
-                                .arg(&cfg.rms_norm_eps).arg(&(qkv_dim as i32)).arg(&(hidden as i32))
-                                .launch(LaunchConfig { grid_dim: ((qkv_dim as u32 + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
-                                .map_err(|e| LLMError::GpuError(format!("jit add_norm_qkv: {e}")))?;
-                        }
-                        (qkv_out, residual_out, false)
-                    // f16 bias-fused variant (hand-written)
+                    // f16 bias-fused variant
                     } else if let (Some(qkv_bias), Ok(ref fk)) = (weights.qkv_bias, self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_add_norm_qkv_bias_gemv")) {
                         let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
                             .map_err(|e| LLMError::GpuError(format!("fused qkv alloc: {e}")))?;
@@ -466,27 +445,8 @@ mod inner {
                 } else {
                     // First layer: norm+QKV GEMV
                     let fused_qkv_w = weights.fused_qkv.unwrap_or(weights.q_proj);
-                    // JIT norm+QKV (primary, no bias -- bias added separately)
-                    if let Ok(ref fk) = self.loader.get_func("jit_norm_qkv", "fused_rmsnorm_gemv_3584x4608") {
-                        let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
-                            .map_err(|e| LLMError::GpuError(format!("jit qkv alloc: {e}")))?;
-                        let smem = (hidden * 4 + 8 * 4) as u32;
-                        if smem > 49152 {
-                            fk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
-                                .map_err(|e| LLMError::GpuError(format!("jit smem attr: {e}")))?;
-                        }
-                        // JIT param order: (out, input, norm_w, proj_w, eps, out_dim, hidden_size)
-                        unsafe {
-                            self.stream.launch_builder(fk)
-                                .arg(&mut qkv_out).arg(hidden_f16).arg(norm_w).arg(fused_qkv_w)
-                                .arg(&cfg.rms_norm_eps).arg(&(qkv_dim as i32)).arg(&(hidden as i32))
-                                .launch(LaunchConfig { grid_dim: ((qkv_dim as u32 + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
-                                .map_err(|e| LLMError::GpuError(format!("jit norm_qkv: {e}")))?;
-                        }
-                        let residual = hidden_f16.clone();
-                        (qkv_out, residual, false)
-                    // Hand-written bias-fused variant
-                    } else if let (Some(qkv_bias), Ok(ref fk)) = (weights.qkv_bias, self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_norm_qkv_bias_gemv")) {
+                    // Try bias-fused variant first if model has QKV bias
+                    if let (Some(qkv_bias), Ok(ref fk)) = (weights.qkv_bias, self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_norm_qkv_bias_gemv")) {
                         let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
                             .map_err(|e| LLMError::GpuError(format!("fused qkv alloc: {e}")))?;
                         let smem = (hidden * 4 + 8 * 4) as u32;
@@ -635,26 +595,15 @@ mod inner {
                                     .map_err(|e| LLMError::GpuError(format!("fp8 silu_down: {e}")))?;
                             }
                             down_out
-                        } else if let Ok(ref sk) = self.loader.get_func("jit_silu_down", "fused_silu_mul_gemv_18944x3584") {
-                            let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
-                                .map_err(|e| LLMError::GpuError(format!("jit silu_down alloc: {e}")))?;
-                            unsafe {
-                                self.stream.launch_builder(sk)
-                                    .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
-                                    .arg(&(hidden as i32)).arg(&(intermediate as i32))
-                                    .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (8 * 4) as u32 })
-                                    .map_err(|e| LLMError::GpuError(format!("jit silu_down: {e}")))?;
-                            }
-                            down_out
                         } else if let Ok(ref sk) = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv") {
                             let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
-                                .map_err(|e| LLMError::GpuError(format!("fused silu_down alloc: {e}")))?;
+                                .map_err(|e| LLMError::GpuError(format!("silu_down alloc: {e}")))?;
                             unsafe {
                                 self.stream.launch_builder(sk)
                                     .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
                                     .arg(&(hidden as i32)).arg(&(intermediate as i32))
                                     .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (8 * 4) as u32 })
-                                    .map_err(|e| LLMError::GpuError(format!("fused silu_down: {e}")))?;
+                                    .map_err(|e| LLMError::GpuError(format!("silu_down: {e}")))?;
                             }
                             down_out
                         } else {
@@ -687,18 +636,7 @@ mod inner {
                         }
                         let gate = gate_up_out.slice(..intermediate);
                         let up = gate_up_out.slice(intermediate..gate_up_dim);
-                        let mlp = if let Ok(ref sk) = self.loader.get_func("jit_silu_down", "fused_silu_mul_gemv_18944x3584") {
-                            let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
-                                .map_err(|e| LLMError::GpuError(format!("jit silu_down alloc: {e}")))?;
-                            unsafe {
-                                self.stream.launch_builder(sk)
-                                    .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
-                                    .arg(&(hidden as i32)).arg(&(intermediate as i32))
-                                    .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (8 * 4) as u32 })
-                                    .map_err(|e| LLMError::GpuError(format!("jit silu_down: {e}")))?;
-                            }
-                            down_out
-                        } else if let Ok(ref sk) = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv") {
+                        let mlp = if let Ok(ref sk) = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv") {
                             let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
                                 .map_err(|e| LLMError::GpuError(format!("fused silu_down alloc: {e}")))?;
                             let sk_smem = (8 * 4) as u32;
@@ -718,57 +656,9 @@ mod inner {
                     } else {
                         // Fallback: separate O-proj + fused add+norm+gateup
                         let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, 1, hidden, q_dim, &self.loader)?;
-                        let gate_up_dim = intermediate * 2;
-                        // JIT add+norm+gateup (primary)
-                        if let Ok(ref fk) = self.loader.get_func("jit_add_norm_gateup", "fused_add_rmsnorm_gemv_3584x37888") {
-                            let mut gate_up_out = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
-                                .map_err(|e| LLMError::GpuError(format!("jit gateup alloc: {e}")))?;
-                            let mut residual_out2 = unsafe { self.stream.alloc::<f16>(hidden) }
-                                .map_err(|e| LLMError::GpuError(format!("jit residual alloc: {e}")))?;
-                            let smem = (hidden * 4 + 8 * 4) as u32;
-                            if smem > 49152 {
-                                fk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
-                                    .map_err(|e| LLMError::GpuError(format!("jit smem attr: {e}")))?;
-                            }
-                            // JIT param order: (out, res_out, input, add, norm_w, proj_w, eps, out_dim, hidden_size)
-                            unsafe {
-                                self.stream.launch_builder(fk)
-                                    .arg(&mut gate_up_out).arg(&mut residual_out2)
-                                    .arg(&residual_ref).arg(&attn_proj).arg(post_norm_w).arg(fused_gate_up_w)
-                                    .arg(&cfg.rms_norm_eps).arg(&(gate_up_dim as i32)).arg(&(hidden as i32))
-                                    .launch(LaunchConfig { grid_dim: ((gate_up_dim as u32 + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
-                                    .map_err(|e| LLMError::GpuError(format!("jit add_norm_gateup: {e}")))?;
-                            }
-                            let gate = gate_up_out.slice(..intermediate);
-                            let up = gate_up_out.slice(intermediate..gate_up_dim);
-                            let mlp = if let Ok(ref sk) = self.loader.get_func("jit_silu_down", "fused_silu_mul_gemv_18944x3584") {
-                                let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
-                                    .map_err(|e| LLMError::GpuError(format!("jit silu_down alloc: {e}")))?;
-                                unsafe {
-                                    self.stream.launch_builder(sk)
-                                        .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
-                                        .arg(&(hidden as i32)).arg(&(intermediate as i32))
-                                        .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (8 * 4) as u32 })
-                                        .map_err(|e| LLMError::GpuError(format!("jit silu_down: {e}")))?;
-                                }
-                                down_out
-                            } else if let Ok(ref sk) = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv") {
-                                let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
-                                    .map_err(|e| LLMError::GpuError(format!("fused silu_down alloc: {e}")))?;
-                                unsafe {
-                                    self.stream.launch_builder(sk)
-                                        .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
-                                        .arg(&(hidden as i32)).arg(&(intermediate as i32))
-                                        .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (8 * 4) as u32 })
-                                        .map_err(|e| LLMError::GpuError(format!("fused silu_down: {e}")))?;
-                                }
-                                down_out
-                            } else {
-                                let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up_out, intermediate)?;
-                                Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?
-                            };
-                            (residual_out2, mlp)
-                        } else if let Ok(ref fk) = self.loader.get_func("fused_add_norm_gateup_gemv", "fused_cute_add_norm_gateup_gemv") {
+                        let fused_gateup_ok = self.loader.get_func("fused_add_norm_gateup_gemv", "fused_cute_add_norm_gateup_gemv").ok();
+                        if let Some(ref fk) = fused_gateup_ok {
+                            let gate_up_dim = intermediate * 2;
                             let mut gate_up_out = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
                                 .map_err(|e| LLMError::GpuError(format!("fused gateup alloc: {e}")))?;
                             let mut residual_out2 = unsafe { self.stream.alloc::<f16>(hidden) }
@@ -789,25 +679,15 @@ mod inner {
                             }
                             let gate = gate_up_out.slice(..intermediate);
                             let up = gate_up_out.slice(intermediate..gate_up_dim);
-                            let mlp = if let Ok(ref sk) = self.loader.get_func("jit_silu_down", "fused_silu_mul_gemv_18944x3584") {
-                                let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
-                                    .map_err(|e| LLMError::GpuError(format!("jit silu_down alloc: {e}")))?;
-                                unsafe {
-                                    self.stream.launch_builder(sk)
-                                        .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
-                                        .arg(&(hidden as i32)).arg(&(intermediate as i32))
-                                        .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (8 * 4) as u32 })
-                                        .map_err(|e| LLMError::GpuError(format!("jit silu_down: {e}")))?;
-                                }
-                                down_out
-                            } else if let Ok(ref sk) = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv") {
+                            let mlp = if let Ok(ref sk) = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv") {
                                 let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
                                     .map_err(|e| LLMError::GpuError(format!("fused silu_down alloc: {e}")))?;
+                                let sk_smem = (8 * 4) as u32;
                                 unsafe {
                                     self.stream.launch_builder(sk)
                                         .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
                                         .arg(&(hidden as i32)).arg(&(intermediate as i32))
-                                        .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (8 * 4) as u32 })
+                                        .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: sk_smem })
                                         .map_err(|e| LLMError::GpuError(format!("fused silu_down: {e}")))?;
                                 }
                                 down_out
