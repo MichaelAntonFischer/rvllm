@@ -175,6 +175,8 @@ mod cuda_impl {
         fp8_input_scratch: Option<CudaSlice<u8>>,
         /// Pre-allocated scratch buffers for the forward pass (RefCell for interior mutability).
         f16_scratch: RefCell<Option<F16LayerScratch>>,
+        autotuned_algos: std::collections::HashMap<(usize,usize,usize), (cudarc::cublaslt::sys::cublasLtMatmulAlgo_t, usize)>,
+        autotune_workspace: Option<CudaSlice<u8>>,
     }
 
     impl GpuModelRunner {
@@ -338,6 +340,8 @@ mod cuda_impl {
                 fp8_down_proj_scale: Vec::new(),
                 fp8_input_scratch: None,
                 f16_scratch: RefCell::new(None),
+                autotuned_algos: std::collections::HashMap::new(),
+                autotune_workspace: None,
             })
         }
 
@@ -517,11 +521,13 @@ mod cuda_impl {
                 ];
                 for (m, n, k, name) in &shapes {
                     match lt_ops.autotune_hgemm(*m, *n, *k) {
-                        Ok((_algo, ws)) => tracing::info!(name, m, n, k, ws, "autotuned"),
+                        Ok((algo, ws)) => { tracing::info!(name, m, n, k, ws, "autotuned"); self.autotuned_algos.insert((*m, *n, *k), (algo, ws)); },
                         Err(e) => tracing::warn!(name, m, n, k, "autotune failed: {e}"),
                     }
                 }
-                tracing::info!("autotuning complete");
+                let max_ws = self.autotuned_algos.values().map(|(_, ws)| *ws).max().unwrap_or(0);
+                if max_ws > 0 { self.autotune_workspace = Some(unsafe { self.stream.alloc::<u8>(max_ws) }.map_err(|e| LLMError::GpuError(format!("ws: {e}")))?); }
+                tracing::info!(shapes = self.autotuned_algos.len(), max_ws, "autotuning complete");
             }
             self.alloc_scratch()?;
             Ok(())
