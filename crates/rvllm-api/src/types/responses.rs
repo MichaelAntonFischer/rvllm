@@ -319,6 +319,12 @@ impl ResponseUsage {
 pub struct ResponseTextFormat {
     #[serde(rename = "type")]
     pub format_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// Text settings returned from a response.
@@ -332,6 +338,9 @@ impl Default for ResponseTextConfig {
         Self {
             format: ResponseTextFormat {
                 format_type: "text".to_string(),
+                name: None,
+                schema: None,
+                strict: None,
             },
         }
     }
@@ -500,6 +509,7 @@ impl ResponseObject {
         top_p: f32,
         metadata: BTreeMap<String, String>,
         parallel_tool_calls: bool,
+        text: ResponseTextConfig,
         tool_choice: ResponseToolChoice,
         tools: Vec<serde_json::Value>,
     ) -> Self {
@@ -520,7 +530,7 @@ impl ResponseObject {
             reasoning: ResponseReasoningSummary::default(),
             store,
             temperature,
-            text: ResponseTextConfig::default(),
+            text,
             tool_choice,
             tools,
             top_p,
@@ -544,6 +554,7 @@ impl ResponseObject {
         output: Vec<ResponseOutputItem>,
         usage: ResponseUsage,
         parallel_tool_calls: bool,
+        text: ResponseTextConfig,
         tool_choice: ResponseToolChoice,
         tools: Vec<serde_json::Value>,
     ) -> Self {
@@ -564,7 +575,7 @@ impl ResponseObject {
             reasoning: ResponseReasoningSummary::default(),
             store,
             temperature,
-            text: ResponseTextConfig::default(),
+            text,
             tool_choice,
             tools,
             top_p,
@@ -614,11 +625,7 @@ impl CreateResponseRequest {
                 }
             }
         }
-        if self.text.is_some() {
-            return Err(ApiError::InvalidRequest(
-                "structured text output is not supported on /v1/responses yet".into(),
-            ));
-        }
+        let _ = self.normalize_text_config()?;
         if self.reasoning.is_some() {
             return Err(ApiError::InvalidRequest(
                 "reasoning configuration is not supported on /v1/responses yet".into(),
@@ -690,11 +697,97 @@ impl CreateResponseRequest {
     }
 
     pub fn to_sampling_params(&self) -> rvllm_core::prelude::SamplingParams {
+        let response_format = self
+            .to_response_format()
+            .unwrap_or(rvllm_core::prelude::ResponseFormat::Text);
         rvllm_core::prelude::SamplingParams {
             temperature: self.temperature,
             top_p: self.top_p,
             max_tokens: self.max_output_tokens.unwrap_or(256),
+            response_format,
             ..Default::default()
+        }
+    }
+
+    pub fn normalize_text_config(&self) -> Result<ResponseTextConfig, ApiError> {
+        let Some(text) = &self.text else {
+            return Ok(ResponseTextConfig::default());
+        };
+        let Some(map) = text.as_object() else {
+            return Err(ApiError::InvalidRequest(
+                "responses text must be an object".into(),
+            ));
+        };
+        let Some(format) = map.get("format") else {
+            return Ok(ResponseTextConfig::default());
+        };
+        let Some(format_map) = format.as_object() else {
+            return Err(ApiError::InvalidRequest(
+                "responses text.format must be an object".into(),
+            ));
+        };
+        let format_type = format_map
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ApiError::InvalidRequest("responses text.format.type is required".into())
+            })?;
+
+        match format_type {
+            "text" => Ok(ResponseTextConfig::default()),
+            "json_object" => Ok(ResponseTextConfig {
+                format: ResponseTextFormat {
+                    format_type: "json_object".to_string(),
+                    name: None,
+                    schema: None,
+                    strict: None,
+                },
+            }),
+            "json_schema" => {
+                let schema = format_map.get("schema").cloned().ok_or_else(|| {
+                    ApiError::InvalidRequest(
+                        "responses text.format.schema is required for json_schema".into(),
+                    )
+                })?;
+                let name = format_map
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let strict = format_map
+                    .get("strict")
+                    .and_then(serde_json::Value::as_bool);
+                Ok(ResponseTextConfig {
+                    format: ResponseTextFormat {
+                        format_type: "json_schema".to_string(),
+                        name,
+                        schema: Some(schema),
+                        strict,
+                    },
+                })
+            }
+            other => Err(ApiError::InvalidRequest(format!(
+                "responses text.format.type '{}' is not supported yet",
+                other
+            ))),
+        }
+    }
+
+    pub fn to_response_format(&self) -> Result<rvllm_core::prelude::ResponseFormat, ApiError> {
+        let text = self.normalize_text_config()?;
+        match text.format.format_type.as_str() {
+            "text" => Ok(rvllm_core::prelude::ResponseFormat::Text),
+            "json_object" => Ok(rvllm_core::prelude::ResponseFormat::JsonObject),
+            "json_schema" => Ok(rvllm_core::prelude::ResponseFormat::JsonSchema {
+                json_schema: text.format.schema.ok_or_else(|| {
+                    ApiError::InvalidRequest(
+                        "responses text.format.schema is required for json_schema".into(),
+                    )
+                })?,
+            }),
+            other => Err(ApiError::InvalidRequest(format!(
+                "responses text.format.type '{}' is not supported yet",
+                other
+            ))),
         }
     }
 
@@ -1083,6 +1176,114 @@ mod tests {
             truncation: None,
         };
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn request_accepts_json_object_text_format() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: Some(serde_json::json!({
+                "format": {"type": "json_object"}
+            })),
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        req.validate().unwrap();
+        assert_eq!(
+            req.to_response_format().unwrap(),
+            rvllm_core::prelude::ResponseFormat::JsonObject
+        );
+    }
+
+    #[test]
+    fn request_accepts_json_schema_text_format() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: Some(serde_json::json!({
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"}
+                        },
+                        "required": ["name"]
+                    },
+                    "strict": true
+                }
+            })),
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        req.validate().unwrap();
+        let text = req.normalize_text_config().unwrap();
+        assert_eq!(text.format.format_type, "json_schema");
+        assert_eq!(text.format.name.as_deref(), Some("answer"));
+        assert_eq!(text.format.strict, Some(true));
+        assert!(matches!(
+            req.to_response_format().unwrap(),
+            rvllm_core::prelude::ResponseFormat::JsonSchema { .. }
+        ));
+    }
+
+    #[test]
+    fn request_rejects_unknown_text_format() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: Some(serde_json::json!({
+                "format": {"type": "xml"}
+            })),
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("responses text.format.type 'xml'"));
     }
 
     #[test]
