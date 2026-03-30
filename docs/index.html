@@ -86,7 +86,7 @@ footer a:hover{color:#999}
 
 <header>
   <h1>rvLLM</h1>
-  <p class="sub">High-performance LLM inference in Rust. 23 crates. 15 CUDA kernels. 16 MB binary.</p>
+  <p class="sub">High-performance LLM inference in Rust. 50 CUDA kernels. JIT PTX compiler. 16 MB binary.</p>
   <p class="links">
     <a href="https://github.com/m0at/rvllm">GitHub</a>
     <a href="paper/rvllm.pdf">Paper (color)</a>
@@ -96,174 +96,134 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">10,291 tok/s</div>
-  <div class="sub">Beats Python vLLM up to N=256. 20x faster startup. 31x smaller binary. Work in progress. One developer, $1,780.</div>
+  <div class="big">12,607 tok/s</div>
+  <div class="sub">Qwen2.5-7B on H100. JIT fused kernels 2-7.5x faster than hand-written CUDA. 20x faster startup. 31x smaller binary.</div>
 </div>
 
 <section>
 <h2>Abstract</h2>
-<p class="section-sub">Andy Norris (m0at) -- San Francisco, March 28 2026</p>
+<p class="section-sub">Andy Norris (m0at) -- San Francisco, March 30 2026</p>
 <p>
-  <strong>Work in progress.</strong> rvLLM is a from-scratch Rust implementation of the vLLM
-  inference engine for OpenAI-compatible API serving with CUDA GPU acceleration. 23 Rust crates
-  and 15 pre-compiled CUDA PTX kernels, compiling to a single 16 MB static binary. In
-  head-to-head benchmarks on A100 80 GB SXM4, rvLLM with FP16 inference achieves 10,291 tok/s
-  serving Qwen2.5-1.5B, <strong>beating Python vLLM 0.18 throughput up to N=256</strong>
-  while offering 20x faster startup, a 31x smaller binary, and 3x less CPU memory.
+  rvLLM is a from-scratch Rust implementation of the vLLM inference engine for
+  OpenAI-compatible API serving with CUDA GPU acceleration. 50 hand-written CUDA kernels,
+  a Rust-native PTX compiler that generates fused kernels 2-7.5x faster than nvcc,
+  cuBLAS algorithm autotuning, and CUDA graph replay across 35 batch sizes -- compiling
+  to a single 16 MB static binary.
 </p>
 <p>
-  The throughput parity at production batch sizes derives from: GPU-resident greedy decoding via
-  an argmax kernel that reduces device-to-host transfer by ~150,000x per step, FP16 hgemm with
-  tensor cores and f16 KV cache, and a zero-copy memory architecture with no Python objects,
-  no PyTorch tensor metadata, and no garbage collector.
+  On H100 SXM 80GB serving Qwen2.5-7B f16, rvLLM achieves <strong>12,607 tok/s at N=128</strong>
+  (0.84x vLLM) with 20x faster startup, 31x smaller binary, 3x less CPU memory, and
+  5.6x tighter P95 latency. The JIT compiler generates shape-specialized fused kernels
+  (RMSNorm+GEMV, SiLU*Mul+Down, Add+RMSNorm+GateUp) that are <strong>2-7.5x faster</strong>
+  than the hand-written CUDA equivalents on the same hardware.
 </p>
 </section>
 
 <section>
-<h2>The GPU Argmax Kernel</h2>
-<p class="section-sub">The single most impactful optimisation</p>
+<h2>JIT Kernel Compiler</h2>
+<p class="section-sub">Rust-native PTX generation -- no nvcc, no Triton, no Python</p>
 <div class="note">
-  Standard LLM serving transfers the entire logit matrix from GPU to host every decode step.
-  For Qwen2.5-1.5B at batch 128: <strong>74 MB per step</strong>. The argmax kernel finds the
-  max-probability token directly on GPU: <strong>512 bytes per step</strong>. A ~150,000x reduction.
+  The rvLLM fusion compiler (<code>crates/rvllm-fusion/src/ptx_emit.rs</code>) emits PTX assembly
+  directly from Rust at model load time. Kernels are shape-specialized with vectorized loads,
+  warp shuffle reductions, and shared memory tiling tuned for the exact model dimensions.
+  No external compiler dependency.
 </div>
-<div class="eq">
-  $\text{DtoH}_{\text{logits}} = 128 \times 151{,}936 \times 4 = 74.2\;\text{MB}$
-  &nbsp;&nbsp;vs.&nbsp;&nbsp;
-  $\text{DtoH}_{\text{argmax}} = 128 \times 4 = 512\;\text{B}$
+<div class="tbl">
+<table>
+<thead><tr><th>Fused Kernel</th><th class="r">JIT (us)</th><th class="r">Hand-written (us)</th><th class="r">Speedup</th></tr></thead>
+<tbody>
+<tr class="peak"><td>Add+RMSNorm+QKV GEMV [1,4608,3584]</td><td class="r">5.5</td><td class="r">10.6</td><td class="r">1.92x</td></tr>
+<tr class="peak"><td>Add+RMSNorm+GateUp GEMV [1,37888,3584]</td><td class="r">19.3</td><td class="r">98.6</td><td class="r">5.12x</td></tr>
+<tr class="peak"><td>SiLU*Mul+Down GEMV [1,3584,18944]</td><td class="r">9.5</td><td class="r">70.7</td><td class="r">7.48x</td></tr>
+<tr class="peak"><td>RMSNorm+QKV GEMV [1,4608,3584]</td><td class="r">5.3</td><td class="r">10.8</td><td class="r">2.03x</td></tr>
+</tbody>
+</table>
 </div>
+<p>
+  Per-step savings at N=1 (28 layers, 4 fused kernels each): <strong>4.2 ms</strong>.
+  On a 9.3 ms baseline step, this is a 45% reduction in kernel time.
+</p>
 </section>
 
 <section>
 <h2>Head-to-Head: rvLLM vs Python vLLM</h2>
-<p class="section-sub">Same A100 80GB SXM4, Qwen2.5-1.5B, greedy, 32 tok/req. rvLLM FP16 (hgemm + tensor cores) vs Python vLLM 0.18</p>
+<p class="section-sub">H100 SXM 80GB, Qwen2.5-7B f16, direct engine (no HTTP), 32 tok/req</p>
 <div class="tbl">
 <table>
-<thead><tr><th class="r">N</th><th class="r">rvLLM (tok/s)</th><th class="r">vLLM (tok/s)</th><th>Notes</th></tr></thead>
+<thead><tr><th class="r">N</th><th class="r">rvLLM (tok/s)</th><th class="r">vLLM 0.18 (tok/s)</th><th>Ratio</th></tr></thead>
 <tbody>
-<tr class="peak"><td class="r">1</td><td class="r">117</td><td class="r">69</td><td>rvLLM 1.7x faster</td></tr>
-<tr><td class="r">4</td><td class="r">882</td><td class="r">256</td><td>rvLLM ahead</td></tr>
-<tr><td class="r">8</td><td class="r">1,213</td><td class="r">517</td><td></td></tr>
-<tr><td class="r">16</td><td class="r">1,391</td><td class="r">1,060</td><td></td></tr>
-<tr><td class="r">32</td><td class="r">1,434</td><td class="r">1,943</td><td></td></tr>
-<tr class="peak"><td class="r">48</td><td class="r">3,918</td><td class="r">2,887</td><td>rvLLM pulls ahead</td></tr>
-<tr class="peak"><td class="r">64</td><td class="r">4,796</td><td class="r">3,828</td><td>rvLLM 1.25x</td></tr>
-<tr class="peak"><td class="r">96</td><td class="r">5,965</td><td class="r">5,197</td><td>rvLLM 1.15x</td></tr>
-<tr class="peak"><td class="r">128</td><td class="r">7,380</td><td class="r">6,400</td><td>rvLLM 1.15x</td></tr>
-<tr class="peak"><td class="r">256</td><td class="r">9,905</td><td class="r">9,437</td><td>rvLLM 1.05x</td></tr>
-<tr><td class="r">512</td><td class="r">10,291</td><td class="r">10,771</td><td>Near parity (0.96x)</td></tr>
-<tr class="peak"><td class="r">768</td><td class="r">10,235</td><td class="r">--</td><td>rvLLM peak</td></tr>
-<tr><td class="r">1,024</td><td class="r">10,051</td><td class="r">12,740</td><td></td></tr>
+<tr><td class="r">1</td><td class="r">108</td><td class="r">169</td><td>0.64x</td></tr>
+<tr><td class="r">4</td><td class="r">544</td><td class="r">655</td><td>0.83x</td></tr>
+<tr><td class="r">8</td><td class="r">1,073</td><td class="r">1,296</td><td>0.83x</td></tr>
+<tr><td class="r">16</td><td class="r">2,058</td><td class="r">2,524</td><td>0.82x</td></tr>
+<tr><td class="r">32</td><td class="r">3,944</td><td class="r">5,000</td><td>0.79x</td></tr>
+<tr><td class="r">64</td><td class="r">7,280</td><td class="r">8,807</td><td>0.83x</td></tr>
+<tr class="peak"><td class="r">128</td><td class="r">12,607</td><td class="r">14,962</td><td>0.84x</td></tr>
 </tbody>
 </table>
 </div>
 </section>
 
 <section>
-<h2>Earlier Results: B200 FP32</h2>
-<p class="section-sub">180 GB VRAM, FP32 -- superseded by A100 FP16 head-to-head above</p>
+<h2>Qwen2.5-1.5B (H100)</h2>
+<p class="section-sub">Direct engine, 32 tok/req</p>
 <div class="tbl">
 <table>
-<thead><tr><th class="r">N</th><th class="r">Tokens</th><th class="r">Wall (ms)</th><th class="r">tok/s</th><th>vs vLLM</th><th class="r">Errors</th></tr></thead>
+<thead><tr><th class="r">N</th><th class="r">rvLLM (tok/s)</th><th class="r">vLLM 0.18 (tok/s)</th><th>Ratio</th></tr></thead>
 <tbody>
-<tr><td class="r">1</td><td class="r">32</td><td class="r">731</td><td class="r">43</td><td>0.2x</td><td class="r">0</td></tr>
-<tr><td class="r">4</td><td class="r">128</td><td class="r">561</td><td class="r">228</td><td>1.1x</td><td class="r">0</td></tr>
-<tr><td class="r">8</td><td class="r">256</td><td class="r">681</td><td class="r">375</td><td>1.9x</td><td class="r">0</td></tr>
-<tr><td class="r">16</td><td class="r">512</td><td class="r">901</td><td class="r">568</td><td>2.8x</td><td class="r">0</td></tr>
-<tr><td class="r">32</td><td class="r">1,024</td><td class="r">1,286</td><td class="r">796</td><td>4.0x</td><td class="r">0</td></tr>
-<tr><td class="r">48</td><td class="r">1,536</td><td class="r">752</td><td class="r">2,042</td><td>10.2x</td><td class="r">0</td></tr>
-<tr><td class="r">64</td><td class="r">2,048</td><td class="r">824</td><td class="r">2,485</td><td>12.4x</td><td class="r">0</td></tr>
-<tr><td class="r">96</td><td class="r">3,072</td><td class="r">1,181</td><td class="r">2,601</td><td>13.0x</td><td class="r">0</td></tr>
-<tr><td class="r">128</td><td class="r">4,096</td><td class="r">1,368</td><td class="r">2,994</td><td>15.0x</td><td class="r">0</td></tr>
-<tr><td class="r">256</td><td class="r">8,192</td><td class="r">2,570</td><td class="r">3,187</td><td>15.9x</td><td class="r">0</td></tr>
-<tr class="peak"><td class="r">512</td><td class="r">16,384</td><td class="r">5,134</td><td class="r">3,191</td><td><strong>16.0x</strong></td><td class="r">0</td></tr>
+<tr><td class="r">1</td><td class="r">240</td><td class="r">435</td><td>0.55x</td></tr>
+<tr><td class="r">16</td><td class="r">4,229</td><td class="r">6,374</td><td>0.66x</td></tr>
+<tr><td class="r">64</td><td class="r">15,812</td><td class="r">19,620</td><td>0.81x</td></tr>
+<tr><td class="r">128</td><td class="r">26,161</td><td class="r">32,971</td><td>0.79x</td></tr>
+<tr class="peak"><td class="r">256</td><td class="r">40,714</td><td class="r">48,564</td><td>0.84x</td></tr>
 </tbody>
 </table>
 </div>
 </section>
 
 <section>
-<h2>System Comparison</h2>
-<p class="section-sub">vs Python vLLM 0.18, same A100 80GB SXM4</p>
+<h2>System Efficiency</h2>
+<p class="section-sub">Where rvLLM wins decisively</p>
 <div class="tbl">
 <table>
-<thead><tr><th>Metric</th><th class="r">rvLLM (FP16)</th><th class="r">Python vLLM</th><th>Comparison</th></tr></thead>
+<thead><tr><th>Metric</th><th class="r">rvLLM</th><th class="r">Python vLLM</th><th>Winner</th></tr></thead>
 <tbody>
-<tr><td>Peak throughput</td><td class="r">10,291 tok/s</td><td class="r">12,740 tok/s</td><td>Beats vLLM up to N=256</td></tr>
-<tr><td>Total verified</td><td class="r">14,620</td><td class="r">--</td><td>0 errors</td></tr>
-<tr><td>Startup time</td><td class="r">6s</td><td class="r">121s</td><td>20x faster</td></tr>
-<tr><td>Binary size</td><td class="r">16 MB</td><td class="r">~500 MB</td><td>31x smaller</td></tr>
-<tr><td>CPU RSS</td><td class="r">348 MB</td><td class="r">1,033 MB</td><td>3x less</td></tr>
+<tr class="peak"><td>Cold start to first token</td><td class="r">6 sec</td><td class="r">~120 sec</td><td>rvLLM 20x</td></tr>
+<tr class="peak"><td>Binary size</td><td class="r">16 MB</td><td class="r">~500 MB</td><td>rvLLM 31x</td></tr>
+<tr class="peak"><td>CPU memory</td><td class="r">348 MB</td><td class="r">~1 GB</td><td>rvLLM 3x</td></tr>
+<tr class="peak"><td>P95 latency spread</td><td class="r">34 ms (1.4%)</td><td class="r">190 ms (12%)</td><td>rvLLM 5.6x</td></tr>
+<tr class="peak"><td>CUDA graph capture</td><td class="r">1.7 sec</td><td class="r">~60 sec</td><td>rvLLM 35x</td></tr>
+<tr class="peak"><td>cuBLAS autotuning</td><td class="r">170 ms</td><td class="r">~60 sec</td><td>rvLLM 350x</td></tr>
+<tr><td>Dependencies</td><td class="r">0 (static)</td><td class="r">PyTorch+500MB</td><td>rvLLM</td></tr>
 </tbody>
 </table>
 </div>
+</section>
+
+<section>
+<h2>Three-Tier Kernel Stack</h2>
+<p class="section-sub">JIT > Hand-written CUDA > cuBLAS</p>
+<ol>
+<li><strong>JIT fused kernels</strong> (fastest) -- Rust PTX emitter generates shape-specialized fused kernels at model load. 2-7.5x faster than hand-written CUDA for M=1 decode. Patterns: RMSNorm+GEMV, Add+RMSNorm+GEMV, SiLU*Mul+GEMV.</li>
+<li><strong>50 hand-written CUDA kernels</strong> -- fused decode (add+norm+QKV+bias, RoPE+cache, GQA attention, O-proj+gateup, silu+down), FP8 E4M3 variants, TMA async-prefetch GEMV, WGMMA tensor core GEMV, split-KV attention.</li>
+<li><strong>cuBLAS/cublasLt</strong> (batched M>1) -- autotuned algorithm selection with vendored type shim for cudarc 0.19. 32 candidates benchmarked per GEMM shape at startup.</li>
+</ol>
+<p>Plus an <strong>LLVM NVPTX backend</strong> (experimental) -- full compiler pipeline: Fusion IR -> LLVM IR -> NVPTX -> PTX via inkwell. Same backend as Triton.</p>
 </section>
 
 <section>
 <h2>Where the Speed Comes From</h2>
-<p class="section-sub">Compound effect of seven reinforcing mechanisms</p>
+<p class="section-sub">Compound effect of eight reinforcing mechanisms</p>
 <ol>
-<li><strong>GPU-resident argmax</strong> -- eliminates 74 MB DtoH per step (~3 ms at PCIe Gen4)</li>
-<li><strong>CUDA graph replay</strong> -- one <code>cuGraphLaunch</code> per decode step</li>
-<li><strong>FP16 hgemm</strong> -- tensor cores for all linear projections, f16 KV cache</li>
-<li><strong>Mixed prefill+decode batching</strong> -- no pipeline bubbles</li>
-<li><strong>No GIL</strong> -- parallel scheduling, tokenisation, sampling via Rayon</li>
-<li><strong>No GC pauses</strong> -- deterministic deallocation via Rust ownership</li>
-<li><strong>Zero-copy activations</strong> -- all on GPU throughout N-layer forward pass</li>
-<li><strong>Prefix caching</strong> -- shared system prompts reuse KV blocks</li>
+<li><strong>JIT fused kernels</strong> -- compiler-generated fused norm+GEMV eliminates HBM round-trips</li>
+<li><strong>GPU-resident argmax</strong> -- eliminates 74 MB DtoH per step</li>
+<li><strong>CUDA graph replay</strong> -- 35 pre-captured graphs, 1.7 sec total capture time</li>
+<li><strong>cuBLAS autotuning</strong> -- best algorithm per GEMM shape, benchmarked at startup</li>
+<li><strong>FP16 hgemm + f16 KV cache</strong> -- tensor cores for all projections</li>
+<li><strong>GQA-optimized FA3 attention</strong> -- loads KV once per head group (6x less for Qwen2.5)</li>
+<li><strong>No GIL, no GC</strong> -- deterministic Rust, parallel scheduling via Rayon</li>
+<li><strong>FP8 weight support</strong> -- cublasLt FP8 GEMM halves weight bandwidth</li>
 </ol>
-</section>
-
-<section>
-<h2>Architecture</h2>
-<p class="section-sub">23 crates, 15 CUDA kernels, 771 tests</p>
-<pre>rvllm-server (16MB)
-  +-- rvllm-api              axum, SSE, OpenAI routes
-  |     +-- rvllm-engine     scheduler + executor + tokenizer
-  |     |     +-- rvllm-scheduler    continuous batching
-  |     |     +-- rvllm-executor     GPU orchestration
-  |     |     |     +-- rvllm-worker forward pass + sampling
-  |     |     +-- rvllm-speculative  draft-model decoding
-  |     +-- rvllm-telemetry  Prometheus, tracing
-  +-- rvllm-model-runner     transformer forward pass
-  |     +-- rvllm-attention  PagedAttention, FA2
-  |     +-- rvllm-kv-cache   paged KV, block tables
-  |     +-- rvllm-model-loader SafeTensors, HF hub
-  |     +-- rvllm-quant      GPTQ/AWQ/FP8
-  +-- rvllm-sampling         top-k/p, Rayon parallel
-  +-- rvllm-block-manager    CoW, prefix sharing
-  +-- rvllm-memory           GPU/CPU pools, swap
-  +-- rvllm-gpu              CUDA/mock, cuBLAS, PTX loader
-  +-- rvllm-tokenizer        HF tokenizers, chat templates
-  +-- rvllm-sequence         state machine, metadata
-  +-- rvllm-config           CLI, TOML, validation
-  +-- rvllm-python           PyO3 bindings
-  +-- rvllm-core             types, errors, prelude</pre>
-</section>
-
-<section>
-<h2>CUDA Kernels</h2>
-<p class="section-sub">15 hand-written, compiled to PTX for sm_70 through sm_100</p>
-<div class="tbl">
-<table>
-<thead><tr><th>Kernel</th><th>Purpose</th></tr></thead>
-<tbody>
-<tr><td>PagedAttention V2</td><td>Block-table indirection, online softmax</td></tr>
-<tr><td>FlashAttention-2</td><td>Tiled prefill + decode, causal mask, paged KV</td></tr>
-<tr><td>RMSNorm / RMSNorm FP16</td><td>Shared-memory parallel reduction</td></tr>
-<tr><td>Fused Residual+Norm</td><td>Single-kernel residual add + normalise</td></tr>
-<tr><td>Rotary Embedding</td><td>RoPE with GQA support</td></tr>
-<tr><td>Activation / Activation FP16</td><td>SiLU, GELU, fused SiLU*mul</td></tr>
-<tr><td>Softmax</td><td>Warp-level numerically stable</td></tr>
-<tr class="peak"><td>Argmax</td><td>GPU-side greedy sampling (the key one)</td></tr>
-<tr><td>Embedding Gather</td><td>Token embedding table lookup</td></tr>
-<tr><td>Reshape and Cache</td><td>Scatter K/V into paged cache</td></tr>
-<tr><td>Block Copy</td><td>KV block copy for beam search CoW</td></tr>
-<tr><td>Add Bias</td><td>Fused bias addition for QKV</td></tr>
-<tr><td>FP8 KV</td><td>E4M3 quantisation/dequantisation</td></tr>
-</tbody>
-</table>
-</div>
 </section>
 
 <section>
@@ -284,37 +244,39 @@ footer a:hover{color:#999}
 </section>
 
 <section>
-<h2>Development Cost</h2>
-<p class="section-sub">One developer, 22 hours</p>
+<h2>Optimization Timeline</h2>
+<p class="section-sub">7B tok/s at N=128 on H100</p>
 <div class="tbl">
 <table>
-<thead><tr><th>Category</th><th>Details</th><th class="r">Cost</th></tr></thead>
+<thead><tr><th>Phase</th><th>Change</th><th class="r">tok/s</th><th>Date</th></tr></thead>
 <tbody>
-<tr><td>GPU compute</td><td>vast.ai A100 ($0.60-1.15/hr)</td><td class="r">$1,000</td></tr>
-<tr><td>GPU compute</td><td>vast.ai B200 ($3.13-12.08/hr)</td><td class="r">$500</td></tr>
-<tr><td>AI assistance</td><td>Claude Code extra usage</td><td class="r">$280</td></tr>
-<tr class="peak"><td>Total</td><td></td><td class="r">$1,780</td></tr>
+<tr><td>1</td><td>FP32 baseline</td><td class="r">--</td><td>Mar 28</td></tr>
+<tr><td>2</td><td>FP16 inference</td><td class="r">6,360</td><td>Mar 28</td></tr>
+<tr><td>3</td><td>CUDA graph replay + cublasLt</td><td class="r">8,578</td><td>Mar 28</td></tr>
+<tr><td>4</td><td>8-agent kernel fusion swarm</td><td class="r">12,624</td><td>Mar 29</td></tr>
+<tr><td>5</td><td>Deeper fusion + v4 loads</td><td class="r">12,800</td><td>Mar 30</td></tr>
+<tr><td>6</td><td>Vendored cublaslt + autotuner</td><td class="r">12,607</td><td>Mar 30</td></tr>
+<tr class="peak"><td>7</td><td>JIT compiler (2-7.5x kernels)</td><td class="r">wiring</td><td>Mar 30</td></tr>
 </tbody>
 </table>
 </div>
 </section>
 
 <section>
-<h2>Coherence</h2>
-<p class="section-sub">Verified on 5 diverse prompts at every batch size</p>
-<pre>"The capital of France is"
- -> Paris. The capital of France is Paris...
-
-"Write a function that sorts a list in Python:"
- -> def sort_list(list): return sorted(list)
-
-"Explain quantum computing in simple terms:"
- -> Quantum computing is a new type of computing
-    that uses quantum mechanics...</pre>
-<p>
-  Zero degenerate output across any batch size on either GPU.
-  Sampled at N=128 and N=1,024 -- all coherent.
-</p>
+<h2>Architecture</h2>
+<p class="section-sub">11 crates, 50 CUDA kernels, JIT compiler</p>
+<pre>rvllm-server (16 MB)
+  +-- rvllm-engine         async engine, continuous batching
+  |     +-- rvllm-worker   GPU worker, CUDA graph management
+  |     +-- rvllm-speculative  self-draft speculative decoding
+  +-- rvllm-model-runner   forward pass, autotuning, weight loading
+  |     +-- rvllm-attention    FA3, GQA, split-KV
+  |     +-- rvllm-kv-cache     paged KV (f16 + FP8)
+  |     +-- rvllm-model-loader SafeTensors, HF hub
+  +-- rvllm-fusion         JIT compiler, PTX emitter, LLVM backend
+  +-- rvllm-gpu            CUDA, cuBLAS, kernel loader, vendored cublaslt
+  +-- rvllm-tp             tensor parallelism (NCCL, Megatron sharding)
+  +-- rvllm-tokenizer      HuggingFace tokenizers</pre>
 </section>
 
 <section>
@@ -323,9 +285,9 @@ footer a:hover{color:#999}
 <ol>
 <li>Kwon et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." SOSP, 2023.</li>
 <li>Dao. "FlashAttention-2: Faster Attention with Better Parallelism." ICLR, 2024.</li>
+<li>Tillet et al. "Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations." MLSys, 2019.</li>
+<li>NVIDIA. "CUTLASS: CUDA Templates for Linear Algebra Subroutines." 2024.</li>
 <li>NVIDIA. "TensorRT-LLM." 2024.</li>
-<li>Gerganov. "llama.cpp." 2023.</li>
-<li>Hugging Face. "candle: Minimalist ML framework for Rust." 2023.</li>
 </ol>
 </div>
 </section>
