@@ -133,38 +133,68 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
             };
             let ptx_path = ptx_dir.join(&ptx_name);
 
-            // Cooperative-groups kernels need -rdc=true for device-side grid sync.
-            let needs_rdc = stem == "persistent_layer_decode";
+            // Cooperative-groups kernels need cubin (not PTX) to preserve
+            // grid-level sync. PTX compilation downgrades grid.sync() to
+            // block-level bar.sync which silently breaks the kernel.
+            let needs_cubin = stem == "persistent_layer_decode";
             let arch_flag = format!("-arch={}", arch);
-            let mut nvcc_cmd = Command::new(nvcc);
-            nvcc_cmd.args(["-ptx", &arch_flag, "-O3"]);
-            if needs_rdc {
-                nvcc_cmd.args(["-rdc=true", "--use_fast_math"]);
-            }
-            nvcc_cmd.arg("-o").arg(&ptx_path).arg(&path);
 
-            let status = nvcc_cmd.status();
-
-            match status {
-                Ok(s) if s.success() => {
-                    println!(
-                        "cargo:warning=Compiled kernel: {}.cu -> {} ({})",
-                        stem, ptx_name, arch
-                    );
+            if needs_cubin {
+                // Compile to cubin for cooperative launch
+                let cubin_name = if archs.len() == 1 {
+                    format!("{}.cubin", stem)
+                } else {
+                    format!("{}_{}.cubin", stem, arch)
+                };
+                let cubin_path = ptx_dir.join(&cubin_name);
+                let mut nvcc_cmd = Command::new(nvcc);
+                nvcc_cmd.args(["-cubin", &arch_flag, "-O3", "-rdc=true", "--use_fast_math"]);
+                nvcc_cmd.arg("-o").arg(&cubin_path).arg(&path);
+                let status = nvcc_cmd.status();
+                match status {
+                    Ok(s) if s.success() => {
+                        println!(
+                            "cargo:warning=Compiled kernel: {}.cu -> {} (cubin, {})",
+                            stem, cubin_name, arch
+                        );
+                    }
+                    Ok(s) => {
+                        println!(
+                            "cargo:warning=nvcc cubin failed for {}.cu [{}] (exit {}), skipping",
+                            stem, arch, s.code().unwrap_or(-1)
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "cargo:warning=Failed to run nvcc for {}.cu [{}]: {}, skipping",
+                            stem, arch, e
+                        );
+                    }
                 }
-                Ok(s) => {
-                    println!(
-                        "cargo:warning=nvcc failed for {}.cu [{}] (exit {}), skipping",
-                        stem,
-                        arch,
-                        s.code().unwrap_or(-1)
-                    );
-                }
-                Err(e) => {
-                    println!(
-                        "cargo:warning=Failed to run nvcc for {}.cu [{}]: {}, skipping",
-                        stem, arch, e
-                    );
+            } else {
+                let mut nvcc_cmd = Command::new(nvcc);
+                nvcc_cmd.args(["-ptx", &arch_flag, "-O3"]);
+                nvcc_cmd.arg("-o").arg(&ptx_path).arg(&path);
+                let status = nvcc_cmd.status();
+                match status {
+                    Ok(s) if s.success() => {
+                        println!(
+                            "cargo:warning=Compiled kernel: {}.cu -> {} ({})",
+                            stem, ptx_name, arch
+                        );
+                    }
+                    Ok(s) => {
+                        println!(
+                            "cargo:warning=nvcc failed for {}.cu [{}] (exit {}), skipping",
+                            stem, arch, s.code().unwrap_or(-1)
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "cargo:warning=Failed to run nvcc for {}.cu [{}]: {}, skipping",
+                            stem, arch, e
+                        );
+                    }
                 }
             }
         }
@@ -194,7 +224,7 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
         if let Ok(entries) = fs::read_dir(&ptx_dir) {
             for entry in entries.flatten() {
                 let src = entry.path();
-                if src.extension().and_then(|e| e.to_str()) == Some("ptx") {
+                if matches!(src.extension().and_then(|e| e.to_str()), Some("ptx") | Some("cubin")) {
                     let dst = workspace_ptx.join(src.file_name().unwrap());
                     if let Err(e) = fs::copy(&src, &dst) {
                         println!("cargo:warning=Failed to copy {} -> {}: {e}", src.display(), dst.display());

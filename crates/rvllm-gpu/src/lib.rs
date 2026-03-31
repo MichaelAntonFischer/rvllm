@@ -17,6 +17,8 @@ pub mod cublas_ops;
 pub mod cublas_autotune;
 #[cfg(feature = "cublaslt")]
 pub mod cublaslt_ops;
+#[cfg(feature = "cublaslt")]
+pub mod cublaslt_raw;
 #[cfg(feature = "cuda")]
 pub mod cuda_allocator;
 pub mod cuda_graph;

@@ -4,6 +4,24 @@ Chronological record of all optimization work, benchmarks, and architecture chan
 
 ---
 
+## 2026-03-30: rTriton -- Unified Kernel Layer
+
+**Goal:** Replicate Triton's kernel fusion + our cuBLAS tricks in one standalone Rust crate.
+
+**What was built:** `crates/rtriton/` -- Triton-style GPU kernel compiler with cuBLAS integration:
+- SSA IR (30 ops), builder DSL matching Triton API, 7 optimization passes, PTX codegen (sm_80+)
+- 8 LLM kernels: rmsnorm, fused_residual_rmsnorm, rope, silu_mul, tiled_gemm, gemv, persistent_gemm, flash_attention_decode
+- cuBLAS integration: GemmOp descriptor (F16/FP8/F32), GemmEngine with plan cache, M-threshold routing (cublasLt M<=32, cuBLAS M>32, FP8 cublasLt M=1)
+- Mixed execution graph: GraphNode enum (Triton JIT | cuBLAS GEMM), buffer liveness allocator
+- DecodeLayerPlan: 9-op decode layer (5 Triton + 4 cuBLAS) captured as single CUDA graph
+- H100 SXM roofline model for batch sizing analysis
+
+**Key insight:** Research confirmed vLLM's advantage is NOT from Triton GEMM (cuBLAS wins at all shapes). The wins come from fusing ~20-30 pointwise/reduction ops between GEMMs into ~6-9 Triton kernels, eliminating kernel launch overhead and GMEM round-trips.
+
+**Status:** 50 tests passing (40 unit + 10 integration), zero warnings. Full pipeline validated: builder -> passes -> PTX codegen for all 8 kernels. Mixed Triton+cuBLAS graph test for Llama-7B decode layer. P0 remaining: wire real CUDA driver calls.
+
+---
+
 ## 2026-03-28: Phase 4 -- CUDA Graph Capture/Replay
 
 **Problem:** Graph capture failed with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`.

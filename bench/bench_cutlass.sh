@@ -10,7 +10,7 @@
 #   --arch <sm_XX>          GPU arch (default: auto-detect)
 #   --cutlass-dir <path>    CUTLASS header directory (default: /root/cutlass)
 #   --model <path>          model name or path (default: Qwen/Qwen2.5-1.5B)
-#   --output-len <N>        tokens per request (default: 32)
+#   --output-len <N>        tokens per request (default: 512)
 #   --skip-build            skip Rust binary compilation
 
 set -euo pipefail
@@ -22,7 +22,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ARCH=""
 CUTLASS_DIR="/root/cutlass"
 MODEL="Qwen/Qwen2.5-1.5B"
-OUTPUT_LEN=32
+OUTPUT_LEN=512
 PORT="${PORT:-8000}"
 SKIP_BUILD=0
 BASE_URL="http://localhost:${PORT}"

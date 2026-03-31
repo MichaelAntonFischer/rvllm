@@ -94,9 +94,33 @@ Request -> Tokenizer -> Scheduler -> GPU Forward -> Sampler -> Detokenizer -> Re
 
 ### Kernel Compiler Stack
 
-Three-tier kernel system:
+Three-tier kernel system, with rTriton as the unified kernel layer:
 
-**Tier 1: JIT-compiled fused kernels (fastest)**
+**rTriton: Triton-style JIT compiler + cuBLAS integration (`crates/rtriton/`)**
+
+A standalone Rust reimplementation of OpenAI's Triton GPU kernel compiler, combined with our battle-tested cuBLAS tricks. One crate, one CUDA graph, zero Python:
+
+- **Triton-style builder DSL**: SSA IR with 30+ ops, 7 optimization passes (DCE, constant fold, fusion, coalescing, shared memory planning, software pipelining), PTX codegen targeting sm_80+
+- **8 pre-built LLM kernels**: RMSNorm, fused residual+RMSNorm, RoPE, SiLU*mul, tiled GEMM, GEMV, persistent GEMM (stream-K), flash attention decode (online softmax, paged KV, GQA)
+- **cuBLAS integration**: FP8 cublasLt plan cache, autotuned algorithm selection (32 candidates/shape), graph workspace pre-allocation, M-threshold routing (cublasLt for M<=32, cuBLAS for M>32)
+- **Mixed execution graph**: Triton JIT kernels and cuBLAS GEMMs captured in a single CUDA graph -- zero launch overhead for the full decode layer
+- **Decode layer plan**: 9 operations per layer (5 Triton + 4 cuBLAS), buffer allocation with liveness-based interval coloring for memory reuse
+- **50 tests passing**, compiles on Mac without CUDA (all GPU code behind `cfg(feature = "cuda")`)
+
+A single decode step at c=128 concurrency:
+```
+[rTriton] fused_residual_rmsnorm     -- 1 kernel, eliminates 2 GMEM round-trips
+[cuBLAS]  QKV GEMM (M=128)          -- autotuned cublasLt, FP8 optional
+[rTriton] RoPE + KV cache write     -- fused, no intermediate alloc
+[rTriton] Flash Attention Decode     -- online softmax, paged KV
+[cuBLAS]  O-proj GEMM               -- autotuned
+[rTriton] fused_residual_rmsnorm
+[cuBLAS]  gate_up GEMM              -- autotuned
+[rTriton] SiLU * mul                -- fused activation
+[cuBLAS]  down GEMM                 -- autotuned
+```
+
+**Tier 1: JIT-compiled fused kernels (current production)**
 - Rust PTX emitter generates shape-specialized fused kernels at model load
 - 2-7.5x faster than hand-written CUDA for M=1 decode
 - Patterns: RMSNorm+GEMV, Add+RMSNorm+GEMV, SiLU*Mul+GEMV
@@ -140,6 +164,7 @@ Three-tier kernel system:
 | `rvllm-model-runner` | Forward pass, weight loading, autotuning |
 | `rvllm-gpu` | CUDA abstractions, cuBLAS, kernel loader, vendored cublaslt |
 | `rvllm-fusion` | JIT kernel compiler, PTX emitter, LLVM NVPTX backend |
+| **`rtriton`** | **Triton-style GPU kernel compiler + cuBLAS integration** |
 | `rvllm-kv-cache` | Paged KV cache (f16 + FP8) |
 | `rvllm-attention` | Attention backends (FA3, GQA, split-KV) |
 | `rvllm-speculative` | Speculative decoding (self-draft) |

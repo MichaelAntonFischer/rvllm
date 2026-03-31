@@ -1,0 +1,18 @@
+[package]
+name = "rtriton"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+autotune = []
+
+[dependencies]
+half = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+cudarc = { version = "0.19", features = ["driver"], optional = true }

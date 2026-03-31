@@ -10,14 +10,14 @@
 # Environment variables:
 #   MODEL          - model path or HF repo (default: Qwen/Qwen2.5-1.5B)
 #   PORT           - server port (default: 8000)
-#   GENERATE_TOKENS - tokens to generate per prompt (default: 32)
+#   GENERATE_TOKENS - tokens to generate per prompt (default: 512)
 #   CONTEXT_LENGTHS - space-separated context sizes (default: "512 1024 2048")
 
 set -euo pipefail
 
 MODEL="${MODEL:-Qwen/Qwen2.5-1.5B}"
 PORT="${PORT:-8000}"
-GENERATE_TOKENS="${GENERATE_TOKENS:-32}"
+GENERATE_TOKENS="${GENERATE_TOKENS:-512}"
 CONTEXT_LENGTHS="${CONTEXT_LENGTHS:-512 1024 2048}"
 BASE_URL="http://localhost:${PORT}"
 

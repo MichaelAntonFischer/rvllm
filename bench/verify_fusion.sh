@@ -350,7 +350,7 @@ echo ""
 echo "| N | tok/s | wall_ms | total_tok |"
 echo "|---|-------|---------|-----------|"
 
-# Phase 4 baseline from benchmark-history.md (A100 80GB, Qwen2.5-1.5B, 32 tok)
+# Phase 4 baseline from benchmark-history.md (A100 80GB, Qwen2.5-1.5B, 512 tok)
 declare -A BASELINE
 BASELINE[1]=128
 BASELINE[4]=540

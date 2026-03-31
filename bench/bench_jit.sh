@@ -128,7 +128,7 @@ mv $PTX_DIR/jit_*.ptx "$PTX_DIR/jit_backup/" 2>/dev/null || true
 if [ -f ./target/release/rvllm ]; then
     RVLLM_PTX_DIR=$PTX_DIR RUST_LOG=error \
         ./target/release/rvllm benchmark --model "$MODEL" --dtype half --gpu-memory-utilization 0.9 \
-        --n '1,4,16,64,128' --output-len 32 2>&1 | tee /tmp/bench_no_jit.txt
+        --n '1,4,16,64,128' --output-len 512 2>&1 | tee /tmp/bench_no_jit.txt
 else
     echo "  SKIP: rvllm binary not found"
     echo "N/A" > /tmp/bench_no_jit.txt
@@ -143,7 +143,7 @@ rmdir "$PTX_DIR/jit_backup" 2>/dev/null || true
 if [ -f ./target/release/rvllm ]; then
     RVLLM_PTX_DIR=$PTX_DIR RUST_LOG=error \
         ./target/release/rvllm benchmark --model "$MODEL" --dtype half --gpu-memory-utilization 0.9 \
-        --n '1,4,16,64,128' --output-len 32 2>&1 | tee /tmp/bench_with_jit.txt
+        --n '1,4,16,64,128' --output-len 512 2>&1 | tee /tmp/bench_with_jit.txt
 else
     echo "  SKIP: rvllm binary not found"
     echo "N/A" > /tmp/bench_with_jit.txt

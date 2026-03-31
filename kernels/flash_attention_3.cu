@@ -1,15 +1,23 @@
-// Optimized decode attention kernel: 256 threads, vectorized half2 loads,
-// warp-parallel reductions. Fits in 48KB shared memory (no set_attribute needed).
+// FlashAttention-3 decode kernel with f16 shared memory.
 //
-// Improvements over FA2 (128 threads, scalar loads, block_reduce_sum):
-//   - 2x threads (256 vs 128): better memory latency hiding
-//   - half2 vectorized loads: 2x global memory bandwidth
-//   - Warp-parallel dot products: less sync overhead
-//   - K/V share same shared memory buffer (V loaded after K consumed)
+// Improvements over previous FA3 (f32 smem):
+//   - f16 shared memory: halves smem footprint, freeing L1 cache
+//   - half2 vectorized loads: same as before
+//   - Same warp-parallel reductions, same tile sizes
+//
+// The f16->f32 conversion happens at compute time (register), not at load time
+// (shared memory). This halves smem bandwidth and lets the L1 cache serve more
+// data concurrently.
+//
+// Shared memory layout (f16):
+//   s_kv[BC * head_dim] half   -- K then V tile (reused)
+//   s_score[BC] float          -- attention weights
+//   s_warp[WARPS] float        -- warp reduction scratch
+//
+// Total: 64*128*2 + 64*4 + 8*4 = 16,384 + 288 = 16,672 bytes
+// (half the old f32 kernel's 33,056 bytes!)
 //
 // Launch: grid(num_seqs, num_heads), block(256)
-// Shared: BC * head_dim * sizeof(float) + BC * sizeof(float) + WARPS * sizeof(float)
-//       = 64 * 128 * 4 + 64 * 4 + 8 * 4 = 33,056 bytes (fits in 48KB)
 
 #include <float.h>
 #include <cuda_fp16.h>
@@ -56,13 +64,13 @@ flash_attention_3_decode_f16io_kernel(
 
     const int num_tiles = (context_len + FA3_BC - 1) / FA3_BC;
 
-    // Shared memory: one KV tile buffer (reused for K then V) + scores + warp reduce
-    extern __shared__ float smem[];
-    float* s_kv     = smem;                          // [BC * head_dim]
-    float* s_score  = smem + FA3_BC * head_dim;      // [BC]
-    float* s_warp   = s_score + FA3_BC;              // [WARPS]
+    // Shared memory: f16 KV tile + f32 scores + f32 warp scratch
+    extern __shared__ char smem_raw[];
+    __half* s_kv    = (__half*)smem_raw;                              // [BC * head_dim]
+    float* s_score  = (float*)(s_kv + FA3_BC * head_dim);            // [BC]
+    float* s_warp   = s_score + FA3_BC;                               // [WARPS]
 
-    // Load Q into registers (persistent)
+    // Load Q into registers (persistent across all tiles)
     const int dims_per_thread = (head_dim + FA3_THREADS - 1) / FA3_THREADS;
     float q_reg[4];
     const int q_base = (seq_idx * num_heads + head_idx) * head_dim;
@@ -82,7 +90,7 @@ flash_attention_3_decode_f16io_kernel(
         const int tile_start = tile * FA3_BC;
         const int tile_len = min(FA3_BC, context_len - tile_start);
 
-        // ---- Load K tile (half2 vectorized) ----
+        // ---- Load K tile (half2 vectorized, stays as f16 in smem) ----
         {
             const int total_h2 = (tile_len * head_dim) / 2;
             for (int idx = tid; idx < total_h2; idx += FA3_THREADS) {
@@ -95,10 +103,9 @@ flash_attention_3_decode_f16io_kernel(
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
                 int base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
                 __half2 h2 = *reinterpret_cast<const __half2*>(&key_cache[base]);
-                s_kv[t * head_dim + d]     = __half2float(h2.x);
-                s_kv[t * head_dim + d + 1] = __half2float(h2.y);
+                s_kv[t * head_dim + d]     = h2.x;
+                s_kv[t * head_dim + d + 1] = h2.y;
             }
-            // Handle remainder
             int total_elems = tile_len * head_dim;
             if ((total_elems & 1) && tid == 0) {
                 int e = total_elems - 1;
@@ -106,26 +113,22 @@ flash_attention_3_decode_f16io_kernel(
                 int kv_pos = tile_start + t;
                 int pi = kv_pos / block_size, po = kv_pos % block_size;
                 int pb = block_tables[seq_idx * max_blocks_per_seq + pi];
-                s_kv[t * head_dim + d] = __half2float(key_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d]);
+                s_kv[t * head_dim + d] = key_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d];
             }
         }
         __syncthreads();
 
-        // ---- Q @ K^T (warp-parallel dot products) ----
-        // All threads participate in every iteration to avoid syncthreads deadlock.
+        // ---- Q @ K^T (warp-parallel dot products, f16 smem reads) ----
         for (int t = 0; t < tile_len; t++) {
             float dot = 0.0f;
             #pragma unroll
             for (int r = 0; r < dims_per_thread && r < 4; r++) {
                 int d = tid + r * FA3_THREADS;
-                if (d < head_dim) dot += q_reg[r] * s_kv[t * head_dim + d];
+                if (d < head_dim) dot += q_reg[r] * __half2float(s_kv[t * head_dim + d]);
             }
-            // Intra-warp reduction (no sync needed)
             dot = fa3_warp_sum(dot);
-            // Cross-warp: lane 0 of each warp writes partial sum
             if (lane_id == 0) s_warp[warp_id] = dot;
             __syncthreads();
-            // Thread 0 sums across warps (8 adds, negligible)
             if (tid == 0) {
                 float total = 0.0f;
                 for (int w = 0; w < FA3_WARPS; w++) total += s_warp[w];
@@ -180,8 +183,8 @@ flash_attention_3_decode_f16io_kernel(
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
                 int base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
                 __half2 h2 = *reinterpret_cast<const __half2*>(&value_cache[base]);
-                s_kv[t * head_dim + d]     = __half2float(h2.x);
-                s_kv[t * head_dim + d + 1] = __half2float(h2.y);
+                s_kv[t * head_dim + d]     = h2.x;
+                s_kv[t * head_dim + d + 1] = h2.y;
             }
             int total_elems = tile_len * head_dim;
             if ((total_elems & 1) && tid == 0) {
@@ -190,19 +193,19 @@ flash_attention_3_decode_f16io_kernel(
                 int kv_pos = tile_start + t;
                 int pi = kv_pos / block_size, po = kv_pos % block_size;
                 int pb = block_tables[seq_idx * max_blocks_per_seq + pi];
-                s_kv[t * head_dim + d] = __half2float(value_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d]);
+                s_kv[t * head_dim + d] = value_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d];
             }
         }
         __syncthreads();
 
-        // ---- Accumulate P @ V ----
+        // ---- Accumulate P @ V (f16 V reads from smem) ----
         #pragma unroll
         for (int r = 0; r < dims_per_thread && r < 4; r++) {
             int d = tid + r * FA3_THREADS;
             if (d < head_dim) {
                 float v_acc = 0.0f;
                 for (int t = 0; t < tile_len; t++)
-                    v_acc += s_score[t] * s_kv[t * head_dim + d];
+                    v_acc += s_score[t] * __half2float(s_kv[t * head_dim + d]);
                 acc[r] += v_acc;
             }
         }
@@ -220,20 +223,9 @@ flash_attention_3_decode_f16io_kernel(
     }
 }
 
-// GQA-optimized decode attention: one block per KV head, processes all query heads
-// in the group, loading each KV tile only once.
-// Grid: (num_seqs, num_kv_heads, 1), Block: (256, 1, 1)
-//
-// Shared memory layout:
-//   s_kv:     [BC * head_dim] floats  -- K/V tile buffer (reused)
-//   s_scores: [MAX_HPG * BC] floats   -- per-head softmax weights (all heads stored)
-//   s_warp:   [WARPS] floats          -- warp reduction scratch
-//
-// Strategy per tile:
-//   1. Load K tile once into s_kv
-//   2. For each query head g: compute QK^T, online softmax, store weights in s_scores[g*BC..]
-//   3. Load V tile once into s_kv (overwrites K)
-//   4. For each query head g: accumulate P@V using stored weights from s_scores[g*BC..]
+// ---- GQA-optimized decode kernel ----
+// One block per KV head, all query heads in the group share KV loads.
+// f16 shared memory, same tile sizes as before.
 
 #define FA3_GQA_MAX_HPG 8
 
@@ -267,12 +259,13 @@ flash_attention_3_decode_gqa_f16io_kernel(
     const int num_tiles = (context_len + FA3_BC - 1) / FA3_BC;
     const int dims_per_thread = (head_dim + FA3_THREADS - 1) / FA3_THREADS;
 
-    extern __shared__ float smem[];
-    float* s_kv     = smem;                                             // [BC * head_dim]
-    float* s_scores = smem + FA3_BC * head_dim;                         // [MAX_HPG * BC]
-    float* s_warp   = s_scores + FA3_GQA_MAX_HPG * FA3_BC;             // [WARPS]
+    // Shared memory: f16 KV tile + f32 per-head scores + f32 warp scratch
+    extern __shared__ char smem_raw[];
+    __half* s_kv     = (__half*)smem_raw;                                       // [BC * head_dim]
+    float* s_scores  = (float*)(s_kv + FA3_BC * head_dim);                     // [MAX_HPG * BC]
+    float* s_warp    = s_scores + FA3_GQA_MAX_HPG * FA3_BC;                    // [WARPS]
 
-    // Per-head online softmax state and output accumulators (in registers).
+    // Per-head state in registers
     float head_row_max[FA3_GQA_MAX_HPG];
     float head_row_sum[FA3_GQA_MAX_HPG];
     float head_acc[FA3_GQA_MAX_HPG][4];
@@ -290,7 +283,7 @@ flash_attention_3_decode_gqa_f16io_kernel(
         const int tile_start = tile * FA3_BC;
         const int tile_len = min(FA3_BC, context_len - tile_start);
 
-        // ---- Load K tile ONCE (half2 vectorized) ----
+        // ---- Load K tile ONCE (half2 vectorized, f16 in smem) ----
         {
             const int total_h2 = (tile_len * head_dim) / 2;
             for (int idx = tid; idx < total_h2; idx += FA3_THREADS) {
@@ -303,8 +296,8 @@ flash_attention_3_decode_gqa_f16io_kernel(
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
                 int base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
                 __half2 h2 = *reinterpret_cast<const __half2*>(&key_cache[base]);
-                s_kv[t * head_dim + d]     = __half2float(h2.x);
-                s_kv[t * head_dim + d + 1] = __half2float(h2.y);
+                s_kv[t * head_dim + d]     = h2.x;
+                s_kv[t * head_dim + d + 1] = h2.y;
             }
             int total_elems = tile_len * head_dim;
             if ((total_elems & 1) && tid == 0) {
@@ -313,12 +306,12 @@ flash_attention_3_decode_gqa_f16io_kernel(
                 int kv_pos = tile_start + t;
                 int pi = kv_pos / block_size, po = kv_pos % block_size;
                 int pb = block_tables[seq_idx * max_blocks_per_seq + pi];
-                s_kv[t * head_dim + d] = __half2float(key_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d]);
+                s_kv[t * head_dim + d] = key_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d];
             }
         }
         __syncthreads();
 
-        // ---- For each query head: QK^T + online softmax, store weights ----
+        // ---- For each query head: QK^T + online softmax ----
         for (int g = 0; g < heads_per_group && g < FA3_GQA_MAX_HPG; g++) {
             int head_idx = kv_head_idx * heads_per_group + g;
             float* g_scores = s_scores + g * FA3_BC;
@@ -331,13 +324,13 @@ flash_attention_3_decode_gqa_f16io_kernel(
                 q_reg[r] = (d < head_dim) ? (__half2float(query[q_base + d]) * scale) : 0.0f;
             }
 
-            // Q @ K^T (warp-parallel dot products) -> raw scores into g_scores
+            // Q @ K^T (f16 K from smem)
             for (int t = 0; t < tile_len; t++) {
                 float dot = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < dims_per_thread && r < 4; r++) {
                     int d = tid + r * FA3_THREADS;
-                    if (d < head_dim) dot += q_reg[r] * s_kv[t * head_dim + d];
+                    if (d < head_dim) dot += q_reg[r] * __half2float(s_kv[t * head_dim + d]);
                 }
                 dot = fa3_warp_sum(dot);
                 if (lane_id == 0) s_warp[warp_id] = dot;
@@ -350,7 +343,7 @@ flash_attention_3_decode_gqa_f16io_kernel(
                 __syncthreads();
             }
 
-            // Online softmax: find tile max, rescale previous accumulators, compute weights
+            // Online softmax
             float tile_max = -FLT_MAX;
             if (tid == 0) {
                 for (int t = 0; t < tile_len; t++) tile_max = fmaxf(tile_max, g_scores[t]);
@@ -370,7 +363,6 @@ flash_attention_3_decode_gqa_f16io_kernel(
             }
             head_row_max[g] = new_max;
 
-            // Exponentiate scores and compute tile sum
             if (tid == 0) {
                 float tsum = 0.0f;
                 for (int t = 0; t < tile_len; t++) {
@@ -385,7 +377,7 @@ flash_attention_3_decode_gqa_f16io_kernel(
             __syncthreads();
         }
 
-        // ---- Load V tile ONCE (reuse s_kv, K is consumed) ----
+        // ---- Load V tile ONCE (reuse s_kv, K consumed) ----
         {
             const int total_h2 = (tile_len * head_dim) / 2;
             for (int idx = tid; idx < total_h2; idx += FA3_THREADS) {
@@ -398,8 +390,8 @@ flash_attention_3_decode_gqa_f16io_kernel(
                 int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
                 int base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
                 __half2 h2 = *reinterpret_cast<const __half2*>(&value_cache[base]);
-                s_kv[t * head_dim + d]     = __half2float(h2.x);
-                s_kv[t * head_dim + d + 1] = __half2float(h2.y);
+                s_kv[t * head_dim + d]     = h2.x;
+                s_kv[t * head_dim + d + 1] = h2.y;
             }
             int total_elems = tile_len * head_dim;
             if ((total_elems & 1) && tid == 0) {
@@ -408,12 +400,12 @@ flash_attention_3_decode_gqa_f16io_kernel(
                 int kv_pos = tile_start + t;
                 int pi = kv_pos / block_size, po = kv_pos % block_size;
                 int pb = block_tables[seq_idx * max_blocks_per_seq + pi];
-                s_kv[t * head_dim + d] = __half2float(value_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d]);
+                s_kv[t * head_dim + d] = value_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d];
             }
         }
         __syncthreads();
 
-        // ---- For each query head: accumulate P @ V using stored weights ----
+        // ---- For each query head: accumulate P @ V ----
         for (int g = 0; g < heads_per_group && g < FA3_GQA_MAX_HPG; g++) {
             float* g_scores = s_scores + g * FA3_BC;
             #pragma unroll
@@ -422,7 +414,7 @@ flash_attention_3_decode_gqa_f16io_kernel(
                 if (d < head_dim) {
                     float v_acc = 0.0f;
                     for (int t = 0; t < tile_len; t++)
-                        v_acc += g_scores[t] * s_kv[t * head_dim + d];
+                        v_acc += g_scores[t] * __half2float(s_kv[t * head_dim + d]);
                     head_acc[g][r] += v_acc;
                 }
             }

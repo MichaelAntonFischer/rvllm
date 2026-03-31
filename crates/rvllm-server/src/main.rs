@@ -53,7 +53,7 @@ enum Commands {
         #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
         n: String,
         /// Tokens to generate per request
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = 512)]
         output_len: usize,
         #[arg(long, default_value = "auto")]
         dtype: Dtype,

@@ -1,6 +1,6 @@
 # Benchmark History
 
-All results greedy decoding, 32 tokens/request unless noted.
+All results greedy decoding, 512 tokens/request unless noted. (Prior to 2026-03-30: 32 tokens/request.)
 
 ## Phase 5 (2026-03-30) -- Kernel fusion swarm (H100 SXM 80GB)
 

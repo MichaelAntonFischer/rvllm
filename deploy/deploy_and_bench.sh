@@ -14,7 +14,7 @@
 #   --skip-build        skip Rust binary compilation
 #   --skip-compile      skip kernel PTX compilation
 #   --bench-only        skip coherence tests (implies nothing about build)
-#   --output-len <N>    tokens per benchmark request (default: 32)
+#   --output-len <N>    tokens per benchmark request (default: 512)
 #   --with-cutlass [dir] compile CUTLASS kernels (default dir: /root/cutlass)
 #
 # Environment:
@@ -32,7 +32,7 @@ ARCH=""
 SKIP_BUILD=0
 SKIP_COMPILE=0
 BENCH_ONLY=0
-OUTPUT_LEN=32
+OUTPUT_LEN=512
 WITH_CUTLASS=0
 CUTLASS_DIR="/root/cutlass"
 PORT="${PORT:-8000}"

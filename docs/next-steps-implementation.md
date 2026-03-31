@@ -59,7 +59,7 @@ Qwen2.5-1.5B uses Grouped Query Attention with 12 query heads and 2 KV heads (ra
 A GQA-optimized kernel launches one block per (seq, kv_head) pair with grid (num_seqs, 2, 1). Each block loads KV once and processes all 6 query heads that share it.
 
 ### Why it matters
-For the decode kernel, KV cache loading is the primary bottleneck. With 32-token context and 128 head_dim, each KV tile is 32 * 128 * 2 bytes (f16) = 8KB for K and 8KB for V = 16KB per tile. At 12 heads, that's 12 * 16KB = 192KB per sequence per step. With GQA optimization: 2 * 16KB = 32KB. That's 6x less KV bandwidth.
+For the decode kernel, KV cache loading is the primary bottleneck. With 512-token context and 128 head_dim, each KV tile is 512 * 128 * 2 bytes (f16) = 128KB for K and 128KB for V = 256KB per tile. At 12 heads, that's 12 * 256KB = 3072KB per sequence per step. With GQA optimization: 2 * 256KB = 512KB. That's 6x less KV bandwidth.
 
 At longer contexts (512-4096 tokens), the savings are proportionally larger and attention becomes a bigger fraction of total time.
 

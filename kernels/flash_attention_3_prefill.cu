@@ -1,12 +1,9 @@
-// F16-native prefill attention kernel. Eliminates f32 cast round-trip.
-// f16 inputs/outputs, f32 internal computation, paged KV cache, causal masking, GQA.
+// FlashAttention-3 prefill kernel with f16 shared memory.
 //
-// Based on flash_attention_3.cu (decode) half2 vectorized loads and warp reduction,
-// and flash_attention.cu (prefill) multi-query-token loop and causal masking.
+// Same algorithm as previous FA3 prefill but KV tiles stored as f16 in shared
+// memory instead of f32. Halves smem footprint and bandwidth.
 //
 // Launch: grid(num_seqs, num_heads, 1), block(256)
-// Shared: BC * head_dim * sizeof(float) + BC * sizeof(float) + WARPS * sizeof(float)
-//       = 64 * 128 * 4 + 64 * 4 + 8 * 4 = 33,056 bytes
 
 #include <float.h>
 #include <cuda_fp16.h>
@@ -55,7 +52,6 @@ flash_attention_3_prefill_f16io_kernel(
         ? head_idx
         : (head_idx / (num_heads / num_kv_heads));
 
-    // Query token range for this sequence
     const int q_start = seq_start_pos[seq_idx];
     const int q_end   = seq_start_pos[seq_idx + 1];
     const int q_len   = q_end - q_start;
@@ -64,17 +60,15 @@ flash_attention_3_prefill_f16io_kernel(
     const int num_tiles = (context_len + PF_BC - 1) / PF_BC;
     const int dims_per_thread = (head_dim + PF_THREADS - 1) / PF_THREADS;
 
-    // Shared memory: KV tile buffer (reused for K then V) + scores + warp reduce
-    extern __shared__ float smem[];
-    float* s_kv    = smem;                        // [BC * head_dim]
-    float* s_score = smem + PF_BC * head_dim;     // [BC]
-    float* s_warp  = s_score + PF_BC;             // [WARPS]
+    // Shared memory: f16 KV tile + f32 scores + f32 warp scratch
+    extern __shared__ char smem_raw[];
+    __half* s_kv   = (__half*)smem_raw;                              // [BC * head_dim]
+    float* s_score = (float*)(s_kv + PF_BC * head_dim);             // [BC]
+    float* s_warp  = s_score + PF_BC;                                // [WARPS]
 
-    // Process each query token sequentially
     for (int qi = 0; qi < q_len; qi++) {
         const int q_token_idx = q_start + qi;
 
-        // Causal: this query can attend to KV positions 0..causal_limit (inclusive)
         const int causal_limit = causal
             ? (context_len - q_len + qi)
             : (context_len - 1);
@@ -98,12 +92,11 @@ flash_attention_3_prefill_f16io_kernel(
             const int tile_start = tile * PF_BC;
             const int tile_end_raw = min(tile_start + PF_BC, context_len);
 
-            // Early exit: if causal and entire tile is beyond causal limit, skip
             if (causal && tile_start > causal_limit) break;
 
             const int tile_len = tile_end_raw - tile_start;
 
-            // ---- Load K tile (half2 vectorized, f16 -> f32) ----
+            // ---- Load K tile (half2 vectorized, f16 in smem) ----
             {
                 const int total_h2 = (tile_len * head_dim) / 2;
                 for (int idx = tid; idx < total_h2; idx += PF_THREADS) {
@@ -116,10 +109,9 @@ flash_attention_3_prefill_f16io_kernel(
                     int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
                     int base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
                     __half2 h2 = *reinterpret_cast<const __half2*>(&key_cache[base]);
-                    s_kv[t * head_dim + d]     = __half2float(h2.x);
-                    s_kv[t * head_dim + d + 1] = __half2float(h2.y);
+                    s_kv[t * head_dim + d]     = h2.x;
+                    s_kv[t * head_dim + d + 1] = h2.y;
                 }
-                // Handle odd remainder
                 int total_elems = tile_len * head_dim;
                 if ((total_elems & 1) && tid == 0) {
                     int e = total_elems - 1;
@@ -127,12 +119,12 @@ flash_attention_3_prefill_f16io_kernel(
                     int kv_pos = tile_start + t;
                     int pi = kv_pos / block_size, po = kv_pos % block_size;
                     int pb = block_tables[seq_idx * max_blocks_per_seq + pi];
-                    s_kv[t * head_dim + d] = __half2float(key_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d]);
+                    s_kv[t * head_dim + d] = key_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d];
                 }
             }
             __syncthreads();
 
-            // ---- Q @ K^T (warp-parallel dot products) with causal masking ----
+            // ---- Q @ K^T with causal masking (f16 K from smem) ----
             for (int t = 0; t < tile_len; t++) {
                 int kv_pos = tile_start + t;
 
@@ -140,17 +132,14 @@ flash_attention_3_prefill_f16io_kernel(
                 #pragma unroll
                 for (int r = 0; r < dims_per_thread && r < 4; r++) {
                     int d = tid + r * PF_THREADS;
-                    if (d < head_dim) dot += q_reg[r] * s_kv[t * head_dim + d];
+                    if (d < head_dim) dot += q_reg[r] * __half2float(s_kv[t * head_dim + d]);
                 }
-                // Intra-warp reduction
                 dot = pf_warp_sum(dot);
-                // Cross-warp via shared memory
                 if (lane_id == 0) s_warp[warp_id] = dot;
                 __syncthreads();
                 if (tid == 0) {
                     float total = 0.0f;
                     for (int w = 0; w < PF_WARPS; w++) total += s_warp[w];
-                    // Apply causal mask
                     s_score[t] = (causal && kv_pos > causal_limit) ? -FLT_MAX : total;
                 }
                 __syncthreads();
@@ -167,7 +156,6 @@ flash_attention_3_prefill_f16io_kernel(
             tile_max = s_warp[0];
             __syncthreads();
 
-            // If entire tile is masked out, skip V accumulation
             if (tile_max <= -FLT_MAX + 1.0f) {
                 __syncthreads();
                 continue;
@@ -196,7 +184,7 @@ flash_attention_3_prefill_f16io_kernel(
             row_sum += s_warp[0];
             __syncthreads();
 
-            // ---- Load V tile (reuse s_kv, K is consumed) ----
+            // ---- Load V tile (reuse s_kv, K consumed) ----
             {
                 const int total_h2 = (tile_len * head_dim) / 2;
                 for (int idx = tid; idx < total_h2; idx += PF_THREADS) {
@@ -209,8 +197,8 @@ flash_attention_3_prefill_f16io_kernel(
                     int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
                     int base = ((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d;
                     __half2 h2 = *reinterpret_cast<const __half2*>(&value_cache[base]);
-                    s_kv[t * head_dim + d]     = __half2float(h2.x);
-                    s_kv[t * head_dim + d + 1] = __half2float(h2.y);
+                    s_kv[t * head_dim + d]     = h2.x;
+                    s_kv[t * head_dim + d + 1] = h2.y;
                 }
                 int total_elems = tile_len * head_dim;
                 if ((total_elems & 1) && tid == 0) {
@@ -219,26 +207,26 @@ flash_attention_3_prefill_f16io_kernel(
                     int kv_pos = tile_start + t;
                     int pi = kv_pos / block_size, po = kv_pos % block_size;
                     int pb = block_tables[seq_idx * max_blocks_per_seq + pi];
-                    s_kv[t * head_dim + d] = __half2float(value_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d]);
+                    s_kv[t * head_dim + d] = value_cache[((pb * block_size + po) * num_kv_heads + kv_head_idx) * head_dim + d];
                 }
             }
             __syncthreads();
 
-            // ---- Accumulate P @ V ----
+            // ---- Accumulate P @ V (f16 V from smem) ----
             #pragma unroll
             for (int r = 0; r < dims_per_thread && r < 4; r++) {
                 int d = tid + r * PF_THREADS;
                 if (d < head_dim) {
                     float v_acc = 0.0f;
                     for (int t = 0; t < tile_len; t++)
-                        v_acc += s_score[t] * s_kv[t * head_dim + d];
+                        v_acc += s_score[t] * __half2float(s_kv[t * head_dim + d]);
                     acc[r] += v_acc;
                 }
             }
             __syncthreads();
         }
 
-        // ---- Write output (f32 -> f16) ----
+        // ---- Write output ----
         float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
         int out_base = (q_token_idx * num_heads + head_idx) * head_dim;
         #pragma unroll

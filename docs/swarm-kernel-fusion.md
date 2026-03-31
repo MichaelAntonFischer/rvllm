@@ -202,7 +202,7 @@ Current FA3 decode kernel loads KV cache independently for each of the 12 query 
 - Compute 6 independent QK dot products + softmax + PV accumulations
 - Write 6 output rows
 
-**Expected gain:** ~3-5x reduction in KV cache bandwidth for attention phase. At short context (32 tokens) this is small. At 512+ context, significant.
+**Expected gain:** ~3-5x reduction in KV cache bandwidth for attention phase. At our 512-token benchmark standard, this is already significant. At 2048+ context, even more so.
 
 **Risk:** Higher register pressure (6 query accumulators). May need to reduce BC (tile size) or use register spilling. Profile both approaches.
 

@@ -417,6 +417,7 @@ mod inner {
                         .map_err(|e| LLMError::GpuError(format!("fp8 qkv alloc: {e}")))?;
                     let (qkv_out_ptr, _qog) = DevicePtrMut::device_ptr_mut(&mut qkv, &self.stream);
                     lt_ops.fp8_gemm_a_bt_raw(1, qkv_dim, hidden, fp8_scratch_ptr, qkv_w_ptr, qkv_out_ptr)?;
+                    drop(_qog);
 
                     // Step 3: QKV bias
                     if let Some(bias) = weights.qkv_bias {
@@ -1589,6 +1590,7 @@ mod inner {
                     let (w_ptr, _wg) = DevicePtr::device_ptr(w_fp8, stream);
                     let (out_ptr, _og) = DevicePtrMut::device_ptr_mut(&mut output, stream);
                     lt_ops.fp8_gemm_a_bt_raw(m, n, k, fp8_in_ptr, w_ptr, out_ptr)?;
+                    drop((_wg, _og));
                     return Ok(output);
                 }
             }
@@ -1852,7 +1854,9 @@ mod inner {
 
             const FA3_BC: usize = 64;
             const FA3_THREADS: u32 = 256;
-            let smem = (FA3_BC * head_dim + FA3_BC + 8) * std::mem::size_of::<f32>();
+            // f16 smem: BC*head_dim*sizeof(half) + BC*sizeof(f32) + 8*sizeof(f32)
+            let smem = FA3_BC * head_dim * std::mem::size_of::<u16>()
+                     + (FA3_BC + 8) * std::mem::size_of::<f32>();
             let shared_mem_bytes = smem as u32;
 
             if num_seqs == 0 {
@@ -1935,8 +1939,9 @@ mod inner {
                     const GQA_BC: usize = 64;
                     const GQA_THREADS: u32 = 256;
                     const GQA_MAX_HPG: usize = 8;
-                    // s_kv[BC*head_dim] + s_scores[MAX_HPG*BC] + s_warp[8]
-                    let smem = (GQA_BC * head_dim + GQA_MAX_HPG * GQA_BC + 8) * std::mem::size_of::<f32>();
+                    // f16 smem: s_kv[BC*D]*half + s_scores[HPG*BC]*f32 + s_warp[8]*f32
+                    let smem = GQA_BC * head_dim * std::mem::size_of::<u16>()
+                             + (GQA_MAX_HPG * GQA_BC + 8) * std::mem::size_of::<f32>();
                     let shared_mem_bytes = smem as u32;
 
                     let p_max_context = max_context_len as i32;
@@ -1972,13 +1977,13 @@ mod inner {
                 }
             }
 
-            // FA3 kernel: 256 threads, vectorized half2 loads, warp-parallel reductions.
-            // Shared memory: 33KB (fits in default 48KB, no set_attribute needed).
+            // FA3 kernel: 256 threads, f16 smem, half2 loads, warp-parallel reductions.
             if let Ok(fa3_kernel) = loader.get_func("flash_attention_3", "flash_attention_3_decode_f16io_kernel") {
                 const FA3_BC: usize = 64;
                 const FA3_THREADS: u32 = 256;
-                // Single KV buffer (reused for K then V) + scores + warp_reduce
-                let smem = (FA3_BC * head_dim + FA3_BC + 8) * std::mem::size_of::<f32>();
+                // f16 smem: s_kv[BC*D]*half + s_score[BC]*f32 + s_warp[8]*f32
+                let smem = FA3_BC * head_dim * std::mem::size_of::<u16>()
+                         + (FA3_BC + 8) * std::mem::size_of::<f32>();
                 let shared_mem_bytes = smem as u32;
 
                 let cfg = LaunchConfig {
