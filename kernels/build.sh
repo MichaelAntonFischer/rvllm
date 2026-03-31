@@ -50,9 +50,35 @@ else
     ARCHS="$ALL_ARCHS"
 fi
 
+# CUTLASS include paths (if available)
+CUTLASS_DIR=${CUTLASS_DIR:-/root/cutlass}
+CUTLASS_FLAGS=""
+if [ -d "$CUTLASS_DIR/include" ]; then
+    CUTLASS_FLAGS="-I$CUTLASS_DIR/include -I$CUTLASS_DIR/tools/util/include --expt-relaxed-constexpr"
+    echo "CUTLASS: $CUTLASS_DIR"
+else
+    echo "CUTLASS: not found (CUTLASS kernels will be skipped)"
+fi
+
 echo "NVCC: $($NVCC --version 2>/dev/null | tail -1)"
 echo "Target architectures: $ARCHS"
 echo ""
+
+compile_kernel() {
+    local cu="$1" arch="$2" ptx="$3"
+    local base=$(basename "$cu" .cu)
+    local extra_flags=""
+    # CUTLASS kernels need extra flags + C++17
+    case "$base" in cutlass_*)
+        if [ -z "$CUTLASS_FLAGS" ]; then
+            echo "  SKIP: $base.cu (CUTLASS not found)"
+            return 0
+        fi
+        extra_flags="$CUTLASS_FLAGS -std=c++17"
+        ;;
+    esac
+    $NVCC -ptx -arch="$arch" -O3 $extra_flags -o "$ptx" "$cu" 2>/dev/null
+}
 
 for arch in $ARCHS; do
     echo "=== Compiling for $arch ==="
@@ -64,7 +90,7 @@ for arch in $ARCHS; do
         base=$(basename "$cu" .cu)
         ptx="$OUTDIR/${base}.ptx"
         echo "  $base.cu -> $arch/$base.ptx"
-        $NVCC -ptx -arch="$arch" -O3 -o "$ptx" "$cu" 2>/dev/null || {
+        compile_kernel "$cu" "$arch" "$ptx" || {
             echo "  WARNING: $base.cu failed for $arch (may need newer CUDA toolkit)"
         }
     done
@@ -78,7 +104,7 @@ for cu in "$DIR"/*.cu; do
     base=$(basename "$cu" .cu)
     ptx="$DIR/${base}.ptx"
     echo "  $base.cu -> $base.ptx"
-    $NVCC -ptx -arch=sm_80 -O3 -o "$ptx" "$cu" 2>/dev/null || true
+    compile_kernel "$cu" "sm_80" "$ptx" || true
 done
 
 echo ""

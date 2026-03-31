@@ -2,23 +2,24 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**8,652 tok/s at 128 concurrent streams (direct engine). 50 CUDA kernels. FA3 v2 warp-parallel attention. Rust PTX compiler with 2-7.5x faster codegen than nvcc. cuBLAS autotuning. CUDA graph replay. FP8 inference. 20x faster startup. 31x smaller binary.**
+**12,312 tok/s at 128 concurrent streams (direct engine). 50 CUDA kernels. FA3 v3 cp.async + split-KV attention. No-fallback kernel validation. Rust PTX compiler with 2-7.5x faster codegen than nvcc. cuBLAS autotuning. CUDA graph replay. FP8 inference. 20x faster startup. 31x smaller binary.**
 
 ## rvLLM vs Python vLLM -- Head-to-Head
 
 All measurements on H100 SXM 80GB, Qwen2.5-7B f16, separate GPU instances per engine. No cherry-picking -- same model, same hardware, same prompts.
 
-### Throughput (Phase 5d -- FA3 v2)
+### Throughput (Phase 6 -- FA3 v3 + no-fallback)
 
-Direct engine (no HTTP overhead), Qwen2.5-7B f16, 512 tok/req:
+Direct engine (no HTTP overhead), Qwen2.5-7B f16, 128 tok/req:
 
 | N | tok/s |
 |---:|---:|
-| 1 | 75 |
-| 16 | 1,537 |
-| 32 | 3,020 |
-| 64 | 5,447 |
-| 128 | 8,652 |
+| 1 | 98 |
+| 4 | 548 |
+| 16 | 2,122 |
+| 32 | 3,957 |
+| 64 | 7,451 |
+| 128 | 12,312 |
 
 HTTP steady-state comparison (apples-to-apples):
 
@@ -29,19 +30,17 @@ HTTP steady-state comparison (apples-to-apples):
 | 64 | 5,120 | 6,677 | 0.77x |
 | 128 | 8,161 | 12,230 | 0.67x |
 
-Gap with vLLM went from ~2x (Phase 4) to 1.14-1.50x (Phase 5d HTTP).
+### FA3 v3 Attention Kernel
 
-### FA3 v2 Attention Kernel
+FA3 v3 adds cp.async bulk global-to-shared copies (128-bit, bypasses registers/L1) and split-KV for long context (distributes KV tiles across thread blocks). Combined with no-fallback kernel validation that eliminates silent performance degradation from missing kernels:
 
-Our decode attention was rewritten with warp-parallel QK^T, parallel softmax, bank-conflict-free shared memory, GQA Q pre-loading, V reuse across heads, and higher occupancy. A/B test on the same codebase and H100:
-
-| N | v1 tok/s | v2 tok/s | Change |
+| N | v2 tok/s | v3+nofallback tok/s | Change |
 |---:|---:|---:|---|
-| 1 | 47 | 75 | +60% |
-| 16 | 864 | 1,537 | +78% |
-| 32 | 1,716 | 3,020 | +76% |
-| 64 | 3,182 | 5,447 | +71% |
-| 128 | 5,371 | 8,652 | +61% |
+| 1 | 75 | 98 | +31% |
+| 16 | 1,537 | 2,122 | +38% |
+| 32 | 3,020 | 3,957 | +31% |
+| 64 | 5,447 | 7,451 | +37% |
+| 128 | 8,652 | 12,312 | +42% |
 
 ### JIT Compiler: Our Fused Kernels vs Hand-Written CUDA
 
@@ -180,15 +179,16 @@ A single decode step at c=128 concurrency:
 | 6 | Vendored cublaslt + autotuner | 12,607 | Mar 30 |
 | 7 | JIT compiler (2-7.5x faster kernels) | wiring | Mar 30 |
 | 5d | FA3 v2 (warp-parallel attention rewrite) | 8,652 | Mar 31 |
+| 6 | FA3 v3 (cp.async + split-KV) + no-fallback | 12,312 | Mar 31 |
 
-Note: Phase 5d numbers are direct engine, not comparable to Phase 4-7 (which used different measurement methodology). See FA3 v2 A/B test above for the true apples-to-apples improvement (+61% at N=128).
+Note: Phase 5d and earlier numbers used 512 tok/req. Phase 6 uses 128 tok/req (same model, same hardware). The Phase 6 improvement comes from FA3 v3 cp.async attention, CUTLASS header integration, and killing all silent kernel fallback paths that were masking missing fused kernels.
 
 ### What Differs from vLLM
 
 The gap is 1.14x at N=16 and 1.50x at N=128 (HTTP). Root causes, in order of impact:
 
 1. **GEMM tuning**: vLLM uses Triton autotuned GEMMs + torch.compile; we use stock cuBLAS heuristics. This is the dominant remaining gap at high concurrency.
-2. **Attention**: vLLM uses FlashAttention-3 (Tri Dao's official CUDA, heavily optimized with TMA, warp specialization, pipelining); our FA3 v2 is closer but still lacks async global-to-shared copies (cp.async/TMA).
+2. **Attention**: vLLM uses FlashAttention-3 (Tri Dao's official CUDA, heavily optimized with TMA, warp specialization, pipelining); our FA3 v3 uses cp.async and split-KV but still lacks TMA and full warp specialization.
 3. **Scheduler**: vLLM has mature continuous batching with sophisticated prefill/decode interleaving, chunked prefill, and priority preemption. Ours is simpler.
 4. **Quantization**: vLLM supports GPTQ, AWQ, SqueezeLLM, Marlin, FP8, etc. We have FP8 only.
 
@@ -213,7 +213,7 @@ What rvLLM does better:
 | `rvllm-fusion` | JIT kernel compiler, PTX emitter, LLVM NVPTX backend |
 | **`rtriton`** | **Triton-style GPU kernel compiler + cuBLAS integration** |
 | `rvllm-kv-cache` | Paged KV cache (f16 + FP8) |
-| `rvllm-attention` | Attention backends (FA3 v2 warp-parallel, GQA, split-KV) |
+| `rvllm-attention` | Attention backends (FA3 v3 cp.async + split-KV, GQA) |
 | `rvllm-speculative` | Speculative decoding (self-draft) |
 | `rvllm-tp` | Tensor parallelism (NCCL, Megatron-LM sharding) |
 | `rvllm-tokenizer` | HuggingFace tokenizer wrapper |

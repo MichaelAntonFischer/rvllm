@@ -468,6 +468,10 @@ impl KernelLoader {
             // Fused ops
             ("fused_rope_cache", "fused_rope_cache_f16_kernel"),
             ("fused_residual_rmsnorm_f16", "fused_residual_rmsnorm_f16_kernel"),
+            // T>1 MLP
+            ("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel"),
+            ("deinterleave_qkv", "deinterleave_qkv_f16_kernel"),
+            ("add_bias_broadcast", "add_bias_broadcast_f16_kernel"),
             // Core
             ("rms_norm_f16", "rms_norm_f16_kernel"),
             ("activation_f16", "fused_silu_mul_f16_kernel"),

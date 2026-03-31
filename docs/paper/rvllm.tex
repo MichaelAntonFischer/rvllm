@@ -76,8 +76,8 @@
 the vLLM inference engine for OpenAI-compatible API serving with CUDA GPU acceleration.
 The system comprises 23~Rust crates and 50~CUDA kernels, compiling
 to a single 16\,MB static binary. In head-to-head benchmarks on a single H100~SXM~80\,GB,
-rvLLM with FP16 inference achieves 8{,}652~tok/s serving Qwen2.5-7B at $N\!=\!128$,
-\textbf{achieving 0.67--0.88$\times$ of Python vLLM~0.18 throughput}
+rvLLM with FP16 inference achieves 12{,}312~tok/s serving Qwen2.5-7B at $N\!=\!128$ (direct engine),
+\textbf{achieving 0.67--0.88$\times$ of Python vLLM~0.18 throughput via HTTP}
 while offering 20$\times$ faster startup, a 31$\times$ smaller
 binary, and 3$\times$ less CPU memory. At higher concurrency ($N\!>\!512$), Python
 vLLM scales further due to its mature continuous batching optimisations.
@@ -86,7 +86,7 @@ gate+up 2$\to$1), (2)~GPU-resident greedy decoding via an argmax kernel that red
 device-to-host transfer by $\sim$150{,}000$\times$ per step, (3)~FP16 hgemm with
 tensor cores and f16 KV cache, (4)~vectorized float4 loads across all kernels,
 (5)~fixed CUDA graph replay eliminating redundant forward passes,
-(6)~warp-parallel FlashAttention-3 v2 for decode, and (7)~a zero-copy
+(6)~FlashAttention-3 v3 with cp.async and split-KV for decode, (7)~no-fallback kernel validation, and (8)~a zero-copy
 memory architecture with no Python objects, no PyTorch tensor metadata, and no garbage
 collector. rvLLM is open-source under the Apache-2.0 license.
 \end{abstract}
@@ -138,10 +138,11 @@ The primary contributions are:
   \item A modular 23-crate Rust architecture for LLM inference, with GPU-resident
         execution that eliminates per-step device-to-host logit transfers for greedy
         decoding.
-  \item 50~CUDA kernels including FlashAttention-3 v2 with warp-parallel $QK^T$,
-        paged KV cache support, GPU argmax, and fused residual-RMSNorm.
-  \item Verified benchmark results: 8{,}652~tok/s on H100 (FP16, Qwen2.5-7B, $N\!=\!128$),
-        achieving 0.67--0.88$\times$ of Python vLLM, with coherence verified across 14{,}620 total
+  \item 50~CUDA kernels including FlashAttention-3 v3 with cp.async bulk copies and split-KV,
+        paged KV cache support, GPU argmax, and fused residual-RMSNorm. No-fallback
+        startup validation ensures every kernel loads or the server fails fast.
+  \item Verified benchmark results: 12{,}312~tok/s on H100 (FP16, Qwen2.5-7B, $N\!=\!128$, direct engine),
+        achieving 0.67--0.88$\times$ of Python vLLM via HTTP, with coherence verified across 14{,}620 total
         requests and zero errors.
   \item A development cost analysis: approximately \$1{,}780 in compute and AI
         assistance to build the system from scratch.

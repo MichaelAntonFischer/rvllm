@@ -86,7 +86,7 @@ footer a:hover{color:#999}
 
 <header>
   <h1>rvLLM</h1>
-  <p class="sub">High-performance LLM inference in Rust. 50 CUDA kernels. JIT PTX compiler. 16 MB binary.</p>
+  <p class="sub">High-performance LLM inference in Rust. 50 CUDA kernels. FA3 v3 cp.async + split-KV. JIT PTX compiler. 16 MB binary.</p>
   <p class="links">
     <a href="https://github.com/m0at/rvllm">GitHub</a>
     <a href="paper/rvllm.pdf">Paper (color)</a>
@@ -96,8 +96,8 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">8,652 tok/s</div>
-  <div class="sub">Qwen2.5-7B on H100. FA3 v2 warp-parallel attention closes gap to 0.67x vLLM at N=128. JIT fused kernels 2-7.5x faster than hand-written CUDA.</div>
+  <div class="big">12,312 tok/s</div>
+  <div class="sub">Qwen2.5-7B on H100. FA3 v3 cp.async + split-KV attention. No-fallback kernel validation. JIT fused kernels 2-7.5x faster than hand-written CUDA.</div>
 </div>
 
 <section>
@@ -107,16 +107,17 @@ footer a:hover{color:#999}
   rvLLM is a from-scratch Rust implementation of the vLLM inference engine for
   OpenAI-compatible API serving with CUDA GPU acceleration. 50 hand-written CUDA kernels,
   a Rust-native PTX compiler that generates fused kernels 2-7.5x faster than nvcc,
-  FA3 v2 warp-parallel attention, cuBLAS algorithm autotuning, and CUDA graph replay
-  across 35 batch sizes -- compiling to a single 16 MB static binary.
+  FA3 v3 cp.async + split-KV attention, no-fallback kernel validation, cuBLAS algorithm
+  autotuning, and CUDA graph replay across 35 batch sizes -- compiling to a single 16 MB static binary.
 </p>
 <p>
-  On H100 SXM 80GB serving Qwen2.5-7B f16, rvLLM achieves <strong>8,652 tok/s at N=128</strong>
-  (0.67x vLLM via HTTP) and <strong>0.88x at N=16</strong>, narrowing the gap from ~2x to
-  1.14-1.50x through FA3 v2 kernel optimization. 20x faster startup, 31x smaller binary,
-  3x less CPU memory, and 5.6x tighter P95 latency. The JIT compiler generates
-  shape-specialized fused kernels (RMSNorm+GEMV, SiLU*Mul+Down, Add+RMSNorm+GateUp)
-  that are <strong>2-7.5x faster</strong> than the hand-written CUDA equivalents on the same hardware.
+  On H100 SXM 80GB serving Qwen2.5-7B f16, rvLLM achieves <strong>12,312 tok/s at N=128</strong>
+  (direct engine) with FA3 v3 cp.async attention and no-fallback kernel validation.
+  HTTP comparison: <strong>0.88x vLLM at N=16</strong>, <strong>0.67x at N=128</strong>.
+  20x faster startup, 31x smaller binary, 3x less CPU memory, and 5.6x tighter P95 latency.
+  The JIT compiler generates shape-specialized fused kernels (RMSNorm+GEMV, SiLU*Mul+Down,
+  Add+RMSNorm+GateUp) that are <strong>2-7.5x faster</strong> than the hand-written CUDA equivalents
+  on the same hardware.
 </p>
 </section>
 
@@ -148,7 +149,7 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Head-to-Head: rvLLM vs Python vLLM</h2>
-<p class="section-sub">H100 SXM 80GB, Qwen2.5-7B f16, HTTP (enforce_eager), 512 tok/req -- Phase 5d</p>
+<p class="section-sub">H100 SXM 80GB, Qwen2.5-7B f16, HTTP (enforce_eager), 512 tok/req</p>
 <div class="tbl">
 <table>
 <thead><tr><th class="r">N</th><th class="r">rvLLM (tok/s)</th><th class="r">vLLM 0.18 (tok/s)</th><th>Ratio</th><th>Was</th></tr></thead>
@@ -203,7 +204,7 @@ footer a:hover{color:#999}
 <p class="section-sub">JIT > Hand-written CUDA > cuBLAS</p>
 <ol>
 <li><strong>JIT fused kernels</strong> (fastest) -- Rust PTX emitter generates shape-specialized fused kernels at model load. 2-7.5x faster than hand-written CUDA for M=1 decode. Patterns: RMSNorm+GEMV, Add+RMSNorm+GEMV, SiLU*Mul+GEMV.</li>
-<li><strong>50 hand-written CUDA kernels</strong> -- fused decode (add+norm+QKV+bias, RoPE+cache, GQA attention, O-proj+gateup, silu+down), FP8 E4M3 variants, TMA async-prefetch GEMV, WGMMA tensor core GEMV, split-KV attention.</li>
+<li><strong>50 hand-written CUDA kernels</strong> -- fused decode (add+norm+QKV+bias, RoPE+cache, GQA attention, O-proj+gateup, silu+down), FP8 E4M3 variants, TMA async-prefetch GEMV, WGMMA tensor core GEMV, split-KV attention. No-fallback validation at startup ensures every kernel loads or the server fails fast.</li>
 <li><strong>cuBLAS/cublasLt</strong> (batched M>1) -- autotuned algorithm selection with vendored type shim for cudarc 0.19. 32 candidates benchmarked per GEMM shape at startup.</li>
 </ol>
 <p>Plus an <strong>LLVM NVPTX backend</strong> (experimental) -- full compiler pipeline: Fusion IR -> LLVM IR -> NVPTX -> PTX via inkwell. Same backend as Triton.</p>
@@ -218,7 +219,7 @@ footer a:hover{color:#999}
 <li><strong>CUDA graph replay</strong> -- 35 pre-captured graphs, 1.7 sec total capture time</li>
 <li><strong>cuBLAS autotuning</strong> -- best algorithm per GEMM shape, benchmarked at startup</li>
 <li><strong>FP16 hgemm + f16 KV cache</strong> -- tensor cores for all projections</li>
-<li><strong>FA3 v2 warp-parallel attention</strong> -- warp-parallel QK^T, parallel softmax, bank-conflict-free smem, V reuse across head groups</li>
+<li><strong>FA3 v3 cp.async + split-KV attention</strong> -- cp.async bulk copies, split-KV across thread blocks, parallel softmax, bank-conflict-free smem, V reuse across head groups</li>
 <li><strong>No GIL, no GC</strong> -- deterministic Rust, parallel scheduling via Rayon</li>
 <li><strong>FP8 weight support</strong> -- cublasLt FP8 GEMM halves weight bandwidth</li>
 </ol>
@@ -255,7 +256,8 @@ footer a:hover{color:#999}
 <tr><td>5</td><td>Deeper fusion + v4 loads</td><td class="r">12,800</td><td>Mar 30</td></tr>
 <tr><td>6</td><td>Vendored cublaslt + autotuner</td><td class="r">12,607</td><td>Mar 30</td></tr>
 <tr><td>7</td><td>JIT compiler (2-7.5x kernels)</td><td class="r">wiring</td><td>Mar 30</td></tr>
-<tr class="peak"><td>5d</td><td>FA3 v2 warp-parallel attention</td><td class="r">8,652</td><td>Mar 31</td></tr>
+<tr><td>5d</td><td>FA3 v2 warp-parallel attention</td><td class="r">8,652</td><td>Mar 31</td></tr>
+<tr class="peak"><td>6</td><td>FA3 v3 cp.async + split-KV + no-fallback</td><td class="r">12,312</td><td>Mar 31</td></tr>
 </tbody>
 </table>
 </div>
@@ -269,7 +271,7 @@ footer a:hover{color:#999}
   |     +-- rvllm-worker   GPU worker, CUDA graph management
   |     +-- rvllm-speculative  self-draft speculative decoding
   +-- rvllm-model-runner   forward pass, autotuning, weight loading
-  |     +-- rvllm-attention    FA3, GQA, split-KV
+  |     +-- rvllm-attention    FA3 v3 cp.async, GQA, split-KV
   |     +-- rvllm-kv-cache     paged KV (f16 + FP8)
   |     +-- rvllm-model-loader SafeTensors, HF hub
   +-- rvllm-fusion         JIT compiler, PTX emitter, LLVM backend

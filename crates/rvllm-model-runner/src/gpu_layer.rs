@@ -426,14 +426,16 @@ mod inner {
                     }
 
                     // Step 4: RoPE + cache write
-                    if let Ok(ref fk) = self.loader.get_func("fused_rope_cache", "fused_rope_cache_f16_kernel") {
+                    {
+                        let fk = self.loader.get_func("fused_rope_cache", "fused_rope_cache_f16_kernel")
+                            .map_err(|e| LLMError::GpuError(format!("Required fused_rope_cache kernel missing: {e}")))?;
                         let (mut q_part, mut kv_rest) = qkv.split_at_mut(q_dim);
                         let (mut k_part, v_part) = kv_rest.split_at_mut(kv_dim);
                         let v_view = v_part.slice(..kv_dim);
                         let half_dim = head_dim / 2;
                         let grid_y = num_heads.max(num_kv_heads) as u32;
                         unsafe {
-                            self.stream.launch_builder(fk)
+                            self.stream.launch_builder(&fk)
                                 .arg(&mut q_part).arg(&mut k_part).arg(&v_view)
                                 .arg(input.key_cache).arg(input.value_cache)
                                 .arg(input.rope_cos).arg(input.rope_sin)
@@ -442,23 +444,6 @@ mod inner {
                                 .arg(&(num_kv_heads as i32)).arg(&(head_dim as i32))
                                 .launch(LaunchConfig { grid_dim: (num_tokens as u32, grid_y, 1), block_dim: (half_dim.min(1024) as u32, 1, 1), shared_mem_bytes: 0 })
                                 .map_err(|e| LLMError::GpuError(format!("fused rope+cache: {e}")))?;
-                        }
-                    } else {
-                        {
-                            let (mut q_part, mut kv_part) = qkv.split_at_mut(q_dim);
-                            let mut k_view = kv_part.slice_mut(..kv_dim);
-                            Self::apply_rotary_embedding_f16_views(
-                                &self.stream, &self.loader, &mut q_part, &mut k_view,
-                                &input.positions, input.rope_cos, input.rope_sin,
-                                num_tokens, num_heads, num_kv_heads, head_dim)?;
-                        }
-                        {
-                            let k_view = qkv.slice(q_dim..q_dim + kv_dim);
-                            let v_view = qkv.slice(q_dim + kv_dim..);
-                            Self::cache_write_f16_views(
-                                &self.stream, &self.loader, &k_view, &v_view,
-                                input.key_cache, input.value_cache, &input.slot_mapping,
-                                num_tokens, num_kv_heads, head_dim)?;
                         }
                     }
 
@@ -775,20 +760,19 @@ mod inner {
                                     .map_err(|e| LLMError::GpuError(format!("fp8 silu_down: {e}")))?;
                             }
                             down_out
-                        } else if let Ok(ref sk) = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv") {
+                        } else {
+                            let sk = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv")
+                                .map_err(|e| LLMError::GpuError(format!("Required fused_cute_silu_down_gemv kernel missing: {e}")))?;
                             let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
                                 .map_err(|e| LLMError::GpuError(format!("silu_down alloc: {e}")))?;
                             unsafe {
-                                self.stream.launch_builder(sk)
+                                self.stream.launch_builder(&sk)
                                     .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
                                     .arg(&(hidden as i32)).arg(&(intermediate as i32))
                                     .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (8 * 4) as u32 })
                                     .map_err(|e| LLMError::GpuError(format!("silu_down: {e}")))?;
                             }
                             down_out
-                        } else {
-                            let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up_out, intermediate)?;
-                            Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?
                         };
                         (residual_out2, mlp)
                     } else {
@@ -796,8 +780,9 @@ mod inner {
                         prof!("oproj_start");
                         let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, 1, hidden, q_dim, &self.loader)?;
                         prof!("oproj_done");
-                        let fused_gateup_ok = self.loader.get_func("fused_add_norm_gateup_gemv", "fused_cute_add_norm_gateup_gemv").ok();
-                        if let Some(ref fk) = fused_gateup_ok {
+                        let fk = self.loader.get_func("fused_add_norm_gateup_gemv", "fused_cute_add_norm_gateup_gemv")
+                            .map_err(|e| LLMError::GpuError(format!("Required fused_cute_add_norm_gateup_gemv kernel missing: {e}")))?;
+                        {
                             let gate_up_dim = intermediate * 2;
                             let mut gate_up_out = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
                                 .map_err(|e| LLMError::GpuError(format!("fused gateup alloc: {e}")))?;
@@ -810,7 +795,7 @@ mod inner {
                                     .map_err(|e| LLMError::GpuError(format!("smem attr: {e}")))?;
                             }
                             unsafe {
-                                self.stream.launch_builder(fk)
+                                self.stream.launch_builder(&fk)
                                     .arg(&mut gate_up_out).arg(&mut residual_out2)
                                     .arg(&residual_ref).arg(&attn_proj).arg(post_norm_w).arg(fused_gate_up_w)
                                     .arg(&cfg.rms_norm_eps).arg(&(hidden as i32)).arg(&(gate_up_dim as i32))
@@ -820,28 +805,19 @@ mod inner {
                             prof!("add_norm_gateup_done");
                             let gate = gate_up_out.slice(..intermediate);
                             let up = gate_up_out.slice(intermediate..gate_up_dim);
-                            let mlp = if let Ok(ref sk) = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv") {
-                                let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
-                                    .map_err(|e| LLMError::GpuError(format!("fused silu_down alloc: {e}")))?;
-                                let sk_smem = (8 * 4) as u32;
-                                unsafe {
-                                    self.stream.launch_builder(sk)
-                                        .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
-                                        .arg(&(hidden as i32)).arg(&(intermediate as i32))
-                                        .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: sk_smem })
-                                        .map_err(|e| LLMError::GpuError(format!("fused silu_down: {e}")))?;
-                                }
-                                down_out
-                            } else {
-                                let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up_out, intermediate)?;
-                                Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?
-                            };
-                            (residual_out2, mlp)
-                        } else {
-                            return Err(LLMError::GpuError(
-                                "No fused MLP kernels loaded (T=1). Required: fused_cute_oproj_add_norm_gateup_gemv \
-                                 or fused_cute_add_norm_gateup_gemv + fused_cute_silu_down_gemv.".into()
-                            ));
+                            let sk = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv")
+                                .map_err(|e| LLMError::GpuError(format!("Required fused_cute_silu_down_gemv kernel missing: {e}")))?;
+                            let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
+                                .map_err(|e| LLMError::GpuError(format!("fused silu_down alloc: {e}")))?;
+                            let sk_smem = (8 * 4) as u32;
+                            unsafe {
+                                self.stream.launch_builder(&sk)
+                                    .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
+                                    .arg(&(hidden as i32)).arg(&(intermediate as i32))
+                                    .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: sk_smem })
+                                    .map_err(|e| LLMError::GpuError(format!("fused silu_down: {e}")))?;
+                            }
+                            (residual_out2, down_out)
                         }
                     }
                 };
@@ -923,33 +899,17 @@ mod inner {
                                 weights.fused_qkv_fp8, s.gate_up)?;
                             // Deinterleave [M, qkv_dim] -> [M*Q, M*K, M*V]
                             let interleaved_len = num_tokens * qkv_dim;
-                            if let Ok(ref dk) = self.loader.get_func("deinterleave_qkv", "deinterleave_qkv_f16_kernel") {
-                                let total = interleaved_len as u32;
-                                let tmp_view = s.gate_up.slice(..interleaved_len);
-                                let mut qkv_view = s.qkv.slice_mut(..interleaved_len);
-                                unsafe {
-                                    self.stream.launch_builder(dk)
-                                        .arg(&mut qkv_view).arg(&tmp_view)
-                                        .arg(&(num_tokens as i32)).arg(&(q_dim as i32)).arg(&(kv_dim as i32))
-                                        .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                                        .map_err(|e| LLMError::GpuError(format!("deinterleave qkv: {e}")))?;
-                                }
-                            } else {
-                                // Fallback: copy-based deinterleave (3 memcpy per token)
-                                let q_end_t = num_tokens * q_dim;
-                                let k_end_t = q_end_t + num_tokens * kv_dim;
-                                for t in 0..num_tokens {
-                                    let src_base = t * qkv_dim;
-                                    let q_src = s.gate_up.slice(src_base..src_base + q_dim);
-                                    let mut q_dst = s.qkv.slice_mut(t * q_dim..(t + 1) * q_dim);
-                                    self.stream.memcpy_dtod(&q_src, &mut q_dst).map_err(|e| LLMError::GpuError(format!("deinterleave q: {e}")))?;
-                                    let k_src = s.gate_up.slice(src_base + q_dim..src_base + q_dim + kv_dim);
-                                    let mut k_dst = s.qkv.slice_mut(q_end_t + t * kv_dim..q_end_t + (t + 1) * kv_dim);
-                                    self.stream.memcpy_dtod(&k_src, &mut k_dst).map_err(|e| LLMError::GpuError(format!("deinterleave k: {e}")))?;
-                                    let v_src = s.gate_up.slice(src_base + q_dim + kv_dim..src_base + qkv_dim);
-                                    let mut v_dst = s.qkv.slice_mut(k_end_t + t * kv_dim..k_end_t + (t + 1) * kv_dim);
-                                    self.stream.memcpy_dtod(&v_src, &mut v_dst).map_err(|e| LLMError::GpuError(format!("deinterleave v: {e}")))?;
-                                }
+                            let dk = self.loader.get_func("deinterleave_qkv", "deinterleave_qkv_f16_kernel")
+                                .map_err(|e| LLMError::GpuError(format!("Required deinterleave_qkv kernel missing: {e}")))?;
+                            let total = interleaved_len as u32;
+                            let tmp_view = s.gate_up.slice(..interleaved_len);
+                            let mut qkv_view = s.qkv.slice_mut(..interleaved_len);
+                            unsafe {
+                                self.stream.launch_builder(&dk)
+                                    .arg(&mut qkv_view).arg(&tmp_view)
+                                    .arg(&(num_tokens as i32)).arg(&(q_dim as i32)).arg(&(kv_dim as i32))
+                                    .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                                    .map_err(|e| LLMError::GpuError(format!("deinterleave qkv: {e}")))?;
                             }
                         }
                     } else {
@@ -963,18 +923,15 @@ mod inner {
                     // For split layout (T>1), add bias per Q/K/V block separately.
                     if let Some(bias) = weights.qkv_bias {
                         if num_tokens == 1 {
-                            if let Ok(ref bk) = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel") {
-                                let total = (num_tokens * qkv_dim) as u32;
-                                let mut qkv_view = s.qkv.slice_mut(..num_tokens * qkv_dim);
-                                unsafe {
-                                    self.stream.launch_builder(bk)
-                                        .arg(&mut qkv_view).arg(bias).arg(&(num_tokens as i32)).arg(&(qkv_dim as i32))
-                                        .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                                        .map_err(|e| LLMError::GpuError(format!("qkv bias: {e}")))?;
-                                }
-                            } else {
-                                let mut v = s.qkv.slice_mut(..q_end);
-                                Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, bias, num_tokens, q_dim)?;
+                            let bk = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel")
+                                .map_err(|e| LLMError::GpuError(format!("Required add_bias_broadcast kernel missing: {e}")))?;
+                            let total = (num_tokens * qkv_dim) as u32;
+                            let mut qkv_view = s.qkv.slice_mut(..num_tokens * qkv_dim);
+                            unsafe {
+                                self.stream.launch_builder(&bk)
+                                    .arg(&mut qkv_view).arg(bias).arg(&(num_tokens as i32)).arg(&(qkv_dim as i32))
+                                    .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                                    .map_err(|e| LLMError::GpuError(format!("qkv bias: {e}")))?;
                             }
                         } else {
                             let q_end_t = num_tokens * q_dim;
@@ -1053,7 +1010,7 @@ mod inner {
                     Self::rms_norm_f16_into(&self.stream, &self.loader, &*s.residual, post_norm_w,
                         cfg.rms_norm_eps, num_tokens, hidden, s.normed)?;
                 } else {
-                    // Fallback: cuBLAS O-proj + fused_residual_rmsnorm
+                    // cuBLAS O-proj + fused_residual_rmsnorm
                     Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &attn_out, weights.o_proj,
                         num_tokens, hidden, q_dim, &self.loader, weights.o_proj_fp8, s.o_proj)?;
                     Self::fused_residual_rmsnorm_f16_into(
@@ -1082,33 +1039,25 @@ mod inner {
                             .map_err(|e| LLMError::GpuError(e))?;
                         // CUTLASS fused: output already in silu_out, skip separate silu_mul
                     } else {
-                        // Fallback: cuBLAS GEMM + separate SiLU*Mul
+                        // cuBLAS GEMM + separate SiLU*Mul
                         Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.normed, fused_gate_up,
                             num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, s.gate_up)?;
-                        if let Ok(ref silu_fn) = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel") {
-                            let n_elems = num_tokens * intermediate;
-                            let total = n_elems as u32;
-                            unsafe {
-                                self.stream.launch_builder(silu_fn)
-                                    .arg(&mut *s.silu_out).arg(&*s.gate_up)
-                                    .arg(&(num_tokens as i32)).arg(&(intermediate as i32))
-                                    .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                                    .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
-                            }
-                        } else {
-                            let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                            let up = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                            let fused = Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
-                            self.stream.memcpy_dtod(&fused, s.silu_out)
-                                .map_err(|e| LLMError::GpuError(format!("silu copy: {e}")))?;
+                        let silu_fn = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
+                            .map_err(|e| LLMError::GpuError(format!("Required silu_mul_interleaved kernel missing: {e}")))?;
+                        let n_elems = num_tokens * intermediate;
+                        let total = n_elems as u32;
+                        unsafe {
+                            self.stream.launch_builder(&silu_fn)
+                                .arg(&mut *s.silu_out).arg(&*s.gate_up)
+                                .arg(&(num_tokens as i32)).arg(&(intermediate as i32))
+                                .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                                .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
                         }
                     }
                 } else {
-                    let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                    let up = Self::hgemm_dispatch(&self.stream, blas, lt, &*s.normed, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                    let fused = Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
-                    self.stream.memcpy_dtod(&fused, s.silu_out)
-                        .map_err(|e| LLMError::GpuError(format!("silu copy: {e}")))?;
+                    return Err(LLMError::GpuError(
+                        "No fused_gate_up weight available. Required for scratch path MLP.".into()
+                    ));
                 }
 
                 // 10. Down projection into scratch
@@ -1191,25 +1140,15 @@ mod inner {
                             weights.fused_qkv_fp8, None)?;
                         let mut qkv_buf = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
                             .map_err(|e| LLMError::GpuError(format!("qkv alloc: {e}")))?;
-                        if let Ok(ref dk) = self.loader.get_func("deinterleave_qkv", "deinterleave_qkv_f16_kernel") {
-                            let total = (num_tokens * qkv_dim) as u32;
-                            unsafe {
-                                self.stream.launch_builder(dk)
-                                    .arg(&mut qkv_buf).arg(&interleaved)
-                                    .arg(&(num_tokens as i32)).arg(&(q_dim as i32)).arg(&(kv_dim as i32))
-                                    .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                                    .map_err(|e| LLMError::GpuError(format!("deinterleave qkv: {e}")))?;
-                            }
-                        } else {
-                            // Fallback: 3 separate GEMMs
-                            let q_w = fused_qkv.slice(0..q_dim * hidden);
-                            let k_w = fused_qkv.slice(q_dim * hidden..(q_dim + kv_dim) * hidden);
-                            let v_w = fused_qkv.slice((q_dim + kv_dim) * hidden..qkv_dim * hidden);
-                            let q_end_t = num_tokens * q_dim;
-                            let k_end_t = q_end_t + num_tokens * kv_dim;
-                            { let mut d = qkv_buf.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, &q_w, num_tokens, q_dim, hidden, &mut d)?; }
-                            { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, &k_w, num_tokens, kv_dim, hidden, &mut d)?; }
-                            { let mut d = qkv_buf.slice_mut(k_end_t..); Self::hgemm_dispatch_into(blas, lt, &normed, &v_w, num_tokens, kv_dim, hidden, &mut d)?; }
+                        let dk = self.loader.get_func("deinterleave_qkv", "deinterleave_qkv_f16_kernel")
+                            .map_err(|e| LLMError::GpuError(format!("Required deinterleave_qkv kernel missing: {e}")))?;
+                        let total = (num_tokens * qkv_dim) as u32;
+                        unsafe {
+                            self.stream.launch_builder(&dk)
+                                .arg(&mut qkv_buf).arg(&interleaved)
+                                .arg(&(num_tokens as i32)).arg(&(q_dim as i32)).arg(&(kv_dim as i32))
+                                .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                                .map_err(|e| LLMError::GpuError(format!("deinterleave qkv: {e}")))?;
                         }
                         qkv_buf
                     }
@@ -1226,18 +1165,15 @@ mod inner {
                 // Bias add: broadcast kernel only valid for interleaved (T=1).
                 if let Some(bias) = weights.qkv_bias {
                     if num_tokens == 1 {
-                        if let Ok(ref bk) = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel") {
-                            let total = (num_tokens * qkv_dim) as u32;
-                            let mut qkv_view = qkv_buf.slice_mut(..num_tokens * qkv_dim);
-                            unsafe {
-                                self.stream.launch_builder(bk)
-                                    .arg(&mut qkv_view).arg(bias).arg(&(num_tokens as i32)).arg(&(qkv_dim as i32))
-                                    .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                                    .map_err(|e| LLMError::GpuError(format!("qkv bias: {e}")))?;
-                            }
-                        } else {
-                            let mut v = qkv_buf.slice_mut(..q_end);
-                            Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, bias, num_tokens, q_dim)?;
+                        let bk = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel")
+                            .map_err(|e| LLMError::GpuError(format!("Required add_bias_broadcast kernel missing: {e}")))?;
+                        let total = (num_tokens * qkv_dim) as u32;
+                        let mut qkv_view = qkv_buf.slice_mut(..num_tokens * qkv_dim);
+                        unsafe {
+                            self.stream.launch_builder(&bk)
+                                .arg(&mut qkv_view).arg(bias).arg(&(num_tokens as i32)).arg(&(qkv_dim as i32))
+                                .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                                .map_err(|e| LLMError::GpuError(format!("qkv bias: {e}")))?;
                         }
                     } else {
                         let q_end_t = num_tokens * q_dim;
@@ -1318,7 +1254,7 @@ mod inner {
                     cfg.rms_norm_eps, num_tokens, hidden)?;
                 (normed2, oproj_out)
             } else {
-                // Fallback: cuBLAS O-proj + fused_residual_rmsnorm
+                // cuBLAS O-proj + fused_residual_rmsnorm
                 let attn_proj = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &attn_out, weights.o_proj,
                     num_tokens, hidden, q_dim, &self.loader, weights.o_proj_fp8, None)?;
                 let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
@@ -1329,7 +1265,7 @@ mod inner {
             let fused_act = if let Some(fused_gate_up) = weights.fused_gate_up {
                 let gate_up_dim = intermediate * 2;
                 if let Some(ref ck) = cutlass {
-                    // CUTLASS FFI: fused GateUp GEMM + SiLU*Mul (self-launching)
+                    // CUTLASS FFI: fused GateUp GEMM + SiLU*Mul
                     let m = num_tokens as i32;
                     let n = gate_up_dim as i32;
                     let k = hidden as i32;
@@ -1347,32 +1283,28 @@ mod inner {
                         .map_err(|e| LLMError::GpuError(e))?;
                     fused_out
                 } else {
-                    // Fallback: cuBLAS GEMM + separate SiLU*Mul
+                    // cuBLAS GEMM + separate SiLU*Mul
                     let gu_interleaved = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed2, fused_gate_up,
                         num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, None)?;
-                    if let Ok(ref silu_fn) = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel") {
-                        let n_elems = num_tokens * intermediate;
-                        let mut fused_out = unsafe { self.stream.alloc::<f16>(n_elems) }
-                            .map_err(|e| LLMError::GpuError(format!("silu_interleaved alloc: {e}")))?;
-                        let total = n_elems as u32;
-                        unsafe {
-                            self.stream.launch_builder(silu_fn)
-                                .arg(&mut fused_out).arg(&gu_interleaved)
-                                .arg(&(num_tokens as i32)).arg(&(intermediate as i32))
-                                .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                                .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
-                        }
-                        fused_out
-                    } else {
-                        let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                        let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                        Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?
+                    let silu_fn = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel")
+                        .map_err(|e| LLMError::GpuError(format!("Required silu_mul_interleaved kernel missing: {e}")))?;
+                    let n_elems = num_tokens * intermediate;
+                    let mut fused_out = unsafe { self.stream.alloc::<f16>(n_elems) }
+                        .map_err(|e| LLMError::GpuError(format!("silu_interleaved alloc: {e}")))?;
+                    let total = n_elems as u32;
+                    unsafe {
+                        self.stream.launch_builder(&silu_fn)
+                            .arg(&mut fused_out).arg(&gu_interleaved)
+                            .arg(&(num_tokens as i32)).arg(&(intermediate as i32))
+                            .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                            .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
                     }
+                    fused_out
                 }
             } else {
-                let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?
+                return Err(LLMError::GpuError(
+                    "No fused_gate_up weight available. Required for MLP path.".into()
+                ));
             };
             let mlp_out = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &fused_act, weights.down_proj,
                 num_tokens, hidden, intermediate, &self.loader, weights.down_proj_fp8, None)?;
@@ -1536,34 +1468,34 @@ mod inner {
             // Works for any M (M=1 decode, M>1 batched decode)
             #[cfg(feature = "cublaslt")]
             if let (Some(w_fp8), Some(lt_ops)) = (fp8_weight, lt) {
-                if let Ok(cast_kernel) = loader.get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel") {
-                    // Cast input [m, k] f16 -> fp8
-                    let total_elems = m * k;
-                    let mut fp8_input_buf = unsafe { stream.alloc::<u8>(total_elems) }
-                        .map_err(|e| LLMError::GpuError(format!("fp8 input alloc: {e}")))?;
-                    let cast_cfg = LaunchConfig {
-                        grid_dim: (((total_elems + 255) / 256) as u32, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let (fp8_in_ptr, _ig) = DevicePtrMut::device_ptr_mut(&mut fp8_input_buf, stream);
-                    let (input_ptr, _ipg) = DevicePtr::device_ptr(input, stream);
-                    unsafe {
-                        stream.launch_builder(&cast_kernel)
-                            .arg(&fp8_in_ptr).arg(&input_ptr).arg(&(total_elems as i32))
-                            .launch(cast_cfg)
-                            .map_err(|e| LLMError::GpuError(format!("cast f16->fp8: {e}")))?;
-                    }
-                    // FP8 GEMM via cublasLt raw API
-                    let (w_ptr, _wg) = DevicePtr::device_ptr(w_fp8, stream);
-                    let (out_ptr, _og) = DevicePtrMut::device_ptr_mut(&mut output, stream);
-                    lt_ops.fp8_gemm_a_bt_raw(m, n, k, fp8_in_ptr, w_ptr, out_ptr)?;
-                    drop((_wg, _og));
-                    return Ok(output);
+                let cast_kernel = loader.get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel")
+                    .map_err(|e| LLMError::GpuError(format!("Required cast_f16_to_fp8 kernel missing (FP8 weights present): {e}")))?;
+                // Cast input [m, k] f16 -> fp8
+                let total_elems = m * k;
+                let mut fp8_input_buf = unsafe { stream.alloc::<u8>(total_elems) }
+                    .map_err(|e| LLMError::GpuError(format!("fp8 input alloc: {e}")))?;
+                let cast_cfg = LaunchConfig {
+                    grid_dim: (((total_elems + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let (fp8_in_ptr, _ig) = DevicePtrMut::device_ptr_mut(&mut fp8_input_buf, stream);
+                let (input_ptr, _ipg) = DevicePtr::device_ptr(input, stream);
+                unsafe {
+                    stream.launch_builder(&cast_kernel)
+                        .arg(&fp8_in_ptr).arg(&input_ptr).arg(&(total_elems as i32))
+                        .launch(cast_cfg)
+                        .map_err(|e| LLMError::GpuError(format!("cast f16->fp8: {e}")))?;
                 }
+                // FP8 GEMM via cublasLt raw API
+                let (w_ptr, _wg) = DevicePtr::device_ptr(w_fp8, stream);
+                let (out_ptr, _og) = DevicePtrMut::device_ptr_mut(&mut output, stream);
+                lt_ops.fp8_gemm_a_bt_raw(m, n, k, fp8_in_ptr, w_ptr, out_ptr)?;
+                drop((_wg, _og));
+                return Ok(output);
             }
 
-            // M=1: custom GEMV kernel (f16 fallback)
+            // M=1: custom GEMV kernel
             if m == 1 {
                 if let Ok(kernel) = loader.get_func("gemv_f16", "gemv_f16_kernel") {
                     let cfg = LaunchConfig {
@@ -1613,28 +1545,28 @@ mod inner {
             // FP8 path
             #[cfg(feature = "cublaslt")]
             if let (Some(w_fp8), Some(lt_ops)) = (fp8_weight, lt) {
-                if let Ok(cast_kernel) = loader.get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel") {
-                    let total_elems = m * k;
-                    let mut fp8_input_buf = unsafe { stream.alloc::<u8>(total_elems) }
-                        .map_err(|e| LLMError::GpuError(format!("fp8 input alloc: {e}")))?;
-                    let cast_cfg = LaunchConfig {
-                        grid_dim: (((total_elems + 255) / 256) as u32, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let (fp8_in_ptr, _ig) = DevicePtrMut::device_ptr_mut(&mut fp8_input_buf, stream);
-                    let (input_ptr, _ipg) = DevicePtr::device_ptr(input, stream);
-                    unsafe {
-                        stream.launch_builder(&cast_kernel)
-                            .arg(&fp8_in_ptr).arg(&input_ptr).arg(&(total_elems as i32))
-                            .launch(cast_cfg)
-                            .map_err(|e| LLMError::GpuError(format!("cast f16->fp8: {e}")))?;
-                    }
-                    let (w_ptr, _wg) = DevicePtr::device_ptr(w_fp8, stream);
-                    let (out_ptr, _og) = DevicePtrMut::device_ptr_mut(output, stream);
-                    lt_ops.fp8_gemm_a_bt_raw(m, n, k, fp8_in_ptr, w_ptr, out_ptr)?;
-                    return Ok(());
+                let cast_kernel = loader.get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel")
+                    .map_err(|e| LLMError::GpuError(format!("Required cast_f16_to_fp8 kernel missing (FP8 weights present): {e}")))?;
+                let total_elems = m * k;
+                let mut fp8_input_buf = unsafe { stream.alloc::<u8>(total_elems) }
+                    .map_err(|e| LLMError::GpuError(format!("fp8 input alloc: {e}")))?;
+                let cast_cfg = LaunchConfig {
+                    grid_dim: (((total_elems + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let (fp8_in_ptr, _ig) = DevicePtrMut::device_ptr_mut(&mut fp8_input_buf, stream);
+                let (input_ptr, _ipg) = DevicePtr::device_ptr(input, stream);
+                unsafe {
+                    stream.launch_builder(&cast_kernel)
+                        .arg(&fp8_in_ptr).arg(&input_ptr).arg(&(total_elems as i32))
+                        .launch(cast_cfg)
+                        .map_err(|e| LLMError::GpuError(format!("cast f16->fp8: {e}")))?;
                 }
+                let (w_ptr, _wg) = DevicePtr::device_ptr(w_fp8, stream);
+                let (out_ptr, _og) = DevicePtrMut::device_ptr_mut(output, stream);
+                lt_ops.fp8_gemm_a_bt_raw(m, n, k, fp8_in_ptr, w_ptr, out_ptr)?;
+                return Ok(());
             }
 
             #[cfg(feature = "cublaslt")]
