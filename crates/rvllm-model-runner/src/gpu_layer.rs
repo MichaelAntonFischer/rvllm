@@ -1939,9 +1939,12 @@ mod inner {
                     const GQA_BC: usize = 64;
                     const GQA_THREADS: u32 = 256;
                     const GQA_MAX_HPG: usize = 8;
-                    // f16 smem: s_kv[BC*D]*half + s_scores[HPG*BC]*f32 + s_warp[8]*f32
-                    let smem = GQA_BC * head_dim * std::mem::size_of::<u16>()
-                             + (GQA_MAX_HPG * GQA_BC + 8) * std::mem::size_of::<f32>();
+                    const GQA_SCORE_STRIDE: usize = GQA_BC + 1;
+                    let gqa_kv_stride = head_dim + 2; // bank conflict padding
+                    // f16 smem: s_kv[BC*(D+2)]*half + s_scores[HPG*(BC+1)]*f32 + s_warp[8]*f32
+                    let smem = GQA_BC * gqa_kv_stride * std::mem::size_of::<u16>()
+                             + GQA_MAX_HPG * GQA_SCORE_STRIDE * std::mem::size_of::<f32>()
+                             + 8 * std::mem::size_of::<f32>();
                     let shared_mem_bytes = smem as u32;
 
                     let p_max_context = max_context_len as i32;
@@ -1981,8 +1984,9 @@ mod inner {
             if let Ok(fa3_kernel) = loader.get_func("flash_attention_3", "flash_attention_3_decode_f16io_kernel") {
                 const FA3_BC: usize = 64;
                 const FA3_THREADS: u32 = 256;
-                // f16 smem: s_kv[BC*D]*half + s_score[BC]*f32 + s_warp[8]*f32
-                let smem = FA3_BC * head_dim * std::mem::size_of::<u16>()
+                let fa3_kv_stride = head_dim + 2; // bank conflict padding
+                // f16 smem: s_kv[BC*(D+2)]*half + s_score[BC]*f32 + s_warp[8]*f32
+                let smem = FA3_BC * fa3_kv_stride * std::mem::size_of::<u16>()
                          + (FA3_BC + 8) * std::mem::size_of::<f32>();
                 let shared_mem_bytes = smem as u32;
 

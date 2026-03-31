@@ -90,8 +90,8 @@ impl CudaSoftmax {
             )));
         }
 
-        let output: CudaSlice<f32> = stream
-            .alloc_zeros(total)
+        // Safety: softmax kernel writes all total elements
+        let output: CudaSlice<f32> = unsafe { stream.alloc(total) }
             .map_err(|e| LLMError::GpuError(format!("softmax output alloc failed: {e}")))?;
 
         self.launch(&output, input, num_rows, vocab_size, stream)?;

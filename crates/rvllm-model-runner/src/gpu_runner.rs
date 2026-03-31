@@ -525,7 +525,8 @@ mod cuda_impl {
             let intermediate = self.config.intermediate_size;
 
             let alloc = |n: usize| -> Result<CudaSlice<f16>> {
-                self.stream.alloc_zeros::<f16>(n)
+                // Safety: scratch buffers are immediately overwritten by kernels each layer
+                unsafe { self.stream.alloc::<f16>(n) }
                     .map_err(|e| LLMError::GpuError(format!("f16 scratch alloc ({n} elems): {e}")))
             };
 
@@ -1035,14 +1036,46 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            // Use scratch buffers for T>1 decode to eliminate per-layer allocations
+            // Use scratch buffers for T>1 decode to eliminate per-layer allocations.
+            // Double-buffered: even layers write to (residual_b, down_b), odd to (a, a).
+            // zero_copy=true eliminates per-layer clone (56 allocs + 56 D2D copies for 28 layers).
             let use_scratch = num_tokens > 1 && !is_prefill;
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
+                let even = layer_idx % 2 == 0;
+
+                // Double-buffer: build scratch ref with write-side, read hidden/mlp from read-side
+                let (mut scratch_ref_opt, hs_ref, pmo_ref): (Option<LayerScratchRef<'_>>, &CudaSlice<f16>, Option<&CudaSlice<f16>>) = if use_scratch {
+                    if let Some(ref mut s) = *scratch_borrow {
+                        let (write_res, write_down, read_res, read_down) = if even {
+                            (&mut s.residual_b, &mut s.down_b, &s.residual_a, &s.down_a)
+                        } else {
+                            (&mut s.residual_a, &mut s.down_a, &s.residual_b, &s.down_b)
+                        };
+                        let pmo = if layer_idx > 0 { Some(read_down as &CudaSlice<f16>) } else { None };
+                        let hs: &CudaSlice<f16> = if layer_idx > 0 { read_res } else { &hidden_f16 };
+                        (Some(LayerScratchRef {
+                            normed: &mut s.normed,
+                            residual: write_res,
+                            qkv: &mut s.qkv,
+                            attn_out: &mut s.attn_out,
+                            o_proj: &mut s.o_proj,
+                            gate_up: &mut s.gate_up,
+                            silu_out: &mut s.silu_out,
+                            down: write_down,
+                            zero_copy: true,
+                        }), hs, pmo)
+                    } else {
+                        (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
+                    }
+                } else {
+                    (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
+                };
+
                 let input = GpuLayerInput {
-                    hidden_states: &hidden_f16,
+                    hidden_states: hs_ref,
                     positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
                     key_cache,
                     value_cache,
@@ -1064,25 +1097,37 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let mut scratch_ref = if use_scratch {
-                    scratch_borrow.as_mut().map(|s| LayerScratchRef {
-                        normed: &mut s.normed,
-                        residual: &mut s.residual_a,
-                        qkv: &mut s.qkv,
-                        attn_out: &mut s.attn_out,
-                        o_proj: &mut s.o_proj,
-                        gate_up: &mut s.gate_up,
-                        silu_out: &mut s.silu_out,
-                        down: &mut s.down_a,
-                        zero_copy: false,
-                    })
-                } else {
-                    None
-                };
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?
-                    .expect("non-zero-copy scratch must return data");
-                hidden_f16 = residual;
-                prev_mlp_out = Some(mlp_out);
+                let result = layer.forward(&input, &weights, &self.blas,
+                    if use_scratch { pmo_ref } else { prev_mlp_out.as_ref() },
+                    self.cublaslt_ref(), scratch_ref_opt.as_mut(), self.cutlass.as_deref())?;
+                if let Some((residual, mlp_out)) = result {
+                    hidden_f16 = residual;
+                    prev_mlp_out = Some(mlp_out);
+                }
+                // zero_copy: results in scratch write-side, next iteration reads via double-buffer swap
+            }
+
+            // Double-buffer: extract final layer results (1 copy at end, not per-layer)
+            if use_scratch {
+                if let Some(ref s) = *scratch_borrow {
+                    let last_even = (num_layers - 1) % 2 == 0;
+                    let (res_src, down_src) = if last_even {
+                        (&s.residual_b, &s.down_b)
+                    } else {
+                        (&s.residual_a, &s.down_a)
+                    };
+                    let n = num_tokens * hidden_size;
+                    let mut res_out = unsafe { self.stream.alloc::<f16>(n) }
+                        .map_err(|e| LLMError::GpuError(format!("final res: {e}")))?;
+                    self.stream.memcpy_dtod(&res_src.slice(..n), &mut res_out)
+                        .map_err(|e| LLMError::GpuError(format!("final res dtod: {e}")))?;
+                    hidden_f16 = res_out;
+                    let mut down_out = unsafe { self.stream.alloc::<f16>(n) }
+                        .map_err(|e| LLMError::GpuError(format!("final mlp: {e}")))?;
+                    self.stream.memcpy_dtod(&down_src.slice(..n), &mut down_out)
+                        .map_err(|e| LLMError::GpuError(format!("final mlp dtod: {e}")))?;
+                    prev_mlp_out = Some(down_out);
+                }
             }
             drop(scratch_borrow);
 
@@ -1203,14 +1248,45 @@ mod cuda_impl {
             let offsets = self.meta_packed_offsets.get();
             // NOTE: No profiling in forward_gpu_only -- this is captured into CUDA graphs.
             // stream.synchronize() during capture would invalidate the graph.
-            // Use scratch buffers for T>1 decode to eliminate per-layer allocations
+            // Double-buffered scratch: even layers write (residual_b, down_b), odd write (a, a).
+            // zero_copy=true eliminates per-layer clone (56 allocs + 56 D2D copies for 28 layers).
             let use_scratch = num_tokens > 1 && !is_prefill;
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
+                let even = layer_idx % 2 == 0;
+
+                // Double-buffer: write-side for this layer, read-side from previous layer
+                let (mut scratch_ref_opt, hs_ref, pmo_ref): (Option<LayerScratchRef<'_>>, &CudaSlice<f16>, Option<&CudaSlice<f16>>) = if use_scratch {
+                    if let Some(ref mut s) = *scratch_borrow {
+                        let (write_res, write_down, read_res, read_down) = if even {
+                            (&mut s.residual_b, &mut s.down_b, &s.residual_a, &s.down_a)
+                        } else {
+                            (&mut s.residual_a, &mut s.down_a, &s.residual_b, &s.down_b)
+                        };
+                        let pmo = if layer_idx > 0 { Some(read_down as &CudaSlice<f16>) } else { None };
+                        let hs: &CudaSlice<f16> = if layer_idx > 0 { read_res } else { &hidden_f16 };
+                        (Some(LayerScratchRef {
+                            normed: &mut s.normed,
+                            residual: write_res,
+                            qkv: &mut s.qkv,
+                            attn_out: &mut s.attn_out,
+                            o_proj: &mut s.o_proj,
+                            gate_up: &mut s.gate_up,
+                            silu_out: &mut s.silu_out,
+                            down: write_down,
+                            zero_copy: true,
+                        }), hs, pmo)
+                    } else {
+                        (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
+                    }
+                } else {
+                    (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
+                };
+
                 let input = GpuLayerInput {
-                    hidden_states: &hidden_f16,
+                    hidden_states: hs_ref,
                     positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
                     key_cache,
                     value_cache,
@@ -1232,25 +1308,36 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let mut scratch_ref = if use_scratch {
-                    scratch_borrow.as_mut().map(|s| LayerScratchRef {
-                        normed: &mut s.normed,
-                        residual: &mut s.residual_a,
-                        qkv: &mut s.qkv,
-                        attn_out: &mut s.attn_out,
-                        o_proj: &mut s.o_proj,
-                        gate_up: &mut s.gate_up,
-                        silu_out: &mut s.silu_out,
-                        down: &mut s.down_a,
-                        zero_copy: false,
-                    })
-                } else {
-                    None
-                };
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?
-                    .expect("non-zero-copy scratch must return data");
-                hidden_f16 = residual;
-                prev_mlp_out = Some(mlp_out);
+                let result = layer.forward(&input, &weights, &self.blas,
+                    if use_scratch { pmo_ref } else { prev_mlp_out.as_ref() },
+                    self.cublaslt_ref(), scratch_ref_opt.as_mut(), self.cutlass.as_deref())?;
+                if let Some((residual, mlp_out)) = result {
+                    hidden_f16 = residual;
+                    prev_mlp_out = Some(mlp_out);
+                }
+            }
+
+            // Double-buffer: extract final layer results (1 copy at end, not per-layer)
+            if use_scratch {
+                if let Some(ref s) = *scratch_borrow {
+                    let last_even = (num_layers - 1) % 2 == 0;
+                    let (res_src, down_src) = if last_even {
+                        (&s.residual_b, &s.down_b)
+                    } else {
+                        (&s.residual_a, &s.down_a)
+                    };
+                    let n = num_tokens * hidden_size;
+                    let mut res_out = unsafe { self.stream.alloc::<f16>(n) }
+                        .map_err(|e| LLMError::GpuError(format!("final res: {e}")))?;
+                    self.stream.memcpy_dtod(&res_src.slice(..n), &mut res_out)
+                        .map_err(|e| LLMError::GpuError(format!("final res dtod: {e}")))?;
+                    hidden_f16 = res_out;
+                    let mut down_out = unsafe { self.stream.alloc::<f16>(n) }
+                        .map_err(|e| LLMError::GpuError(format!("final mlp: {e}")))?;
+                    self.stream.memcpy_dtod(&down_src.slice(..n), &mut down_out)
+                        .map_err(|e| LLMError::GpuError(format!("final mlp dtod: {e}")))?;
+                    prev_mlp_out = Some(down_out);
+                }
             }
             drop(scratch_borrow);
 

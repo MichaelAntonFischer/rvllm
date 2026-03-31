@@ -74,9 +74,8 @@ impl CudaRMSNorm {
             shared_mem_bytes,
         };
 
-        // Allocate output buffer on the stream
-        let output = stream
-            .alloc_zeros::<f32>(num_elements)
+        // Safety: rms_norm kernel writes all num_elements elements
+        let output = unsafe { stream.alloc::<f32>(num_elements) }
             .map_err(|e| LLMError::GpuError(format!("CudaRMSNorm: output alloc failed: {e}")))?;
 
         let hidden_size_i32 = hidden_size as i32;

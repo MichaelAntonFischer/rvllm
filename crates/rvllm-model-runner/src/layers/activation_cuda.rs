@@ -73,8 +73,8 @@ mod inner {
             stream: &Arc<CudaStream>,
         ) -> Result<CudaSlice<f32>> {
             let n = input.len();
-            let mut output = stream
-                .alloc_zeros::<f32>(n)
+            // Safety: SiLU kernel writes all n elements
+            let mut output = unsafe { stream.alloc::<f32>(n) }
                 .map_err(|e| LLMError::GpuError(format!("SiLU alloc failed: {e}")))?;
             let cfg = launch_cfg(n as u32);
             let n_i32 = n as i32;
@@ -150,8 +150,8 @@ mod inner {
             stream: &Arc<CudaStream>,
         ) -> Result<CudaSlice<f32>> {
             let n = input.len();
-            let mut output = stream
-                .alloc_zeros::<f32>(n)
+            // Safety: GELU kernel writes all n elements
+            let mut output = unsafe { stream.alloc::<f32>(n) }
                 .map_err(|e| LLMError::GpuError(format!("GELU alloc failed: {e}")))?;
             let cfg = launch_cfg(n as u32);
             let n_i32 = n as i32;
@@ -240,8 +240,8 @@ mod inner {
                     up.len()
                 )));
             }
-            let mut output = stream
-                .alloc_zeros::<f32>(n)
+            // Safety: fused_silu_mul kernel writes all n elements
+            let mut output = unsafe { stream.alloc::<f32>(n) }
                 .map_err(|e| LLMError::GpuError(format!("fused_silu_mul alloc failed: {e}")))?;
             let cfg = launch_cfg(n as u32);
             let n_i32 = n as i32;

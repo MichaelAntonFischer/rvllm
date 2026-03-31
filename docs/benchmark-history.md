@@ -2,6 +2,60 @@
 
 All results greedy decoding, 512 tokens/request unless noted. (Prior to 2026-03-30: 32 tokens/request.)
 
+## Phase 5d (2026-03-31) -- FA3 v2 kernel optimization (H100 SXM 80GB)
+
+Rewrote FlashAttention-3 decode kernels (both non-GQA and GQA):
+1. Warp-parallel QK^T: 8 positions per round via warp shuffle (was 1 sequential)
+2. Parallel softmax: block-wide reductions (was single-thread)
+3. Bank-conflict-free smem: padded KV stride (+2 half), score stride (+1 float)
+4. GQA: all Q heads pre-loaded into registers, V reused across heads in P@V
+5. Occupancy: __launch_bounds__(256, 2) for both kernels (GQA was 1)
+
+Syncs per tile (GQA, 7 heads): ~38 vs ~924 (24x fewer).
+
+### A/B test: FA3 v1 vs v2 (direct engine, same codebase, same H100)
+
+| N | FA3 v1 | FA3 v2 | change |
+|---|---|---|---|
+| 1 | 47 | 75 | +60% |
+| 16 | 864 | 1,537 | +78% |
+| 32 | 1,716 | 3,020 | +76% |
+| 64 | 3,182 | 5,447 | +71% |
+| 128 | 5,371 | 8,652 | +61% |
+
+### Qwen2.5-7B f16 -- rvLLM vs vLLM 0.18 (512 tok/req, HTTP steady-state)
+
+| N | rvLLM 5d | vLLM 0.18 (eager) | gap | was (5c) |
+|---|---|---|---|---|
+| 16 | 1,503 | 1,714 | vLLM 1.14x | 1.95x |
+| 32 | 2,902 | 3,431 | vLLM 1.18x | 2.01x |
+| 64 | 5,120 | 6,677 | vLLM 1.30x | 2.22x |
+| 128 | 8,161 | 12,230 | vLLM 1.50x | 2.22x |
+
+Gap narrowed from ~2x to 1.14-1.50x. Remaining gap is GEMM-bound:
+vLLM's Triton autotuned GEMMs + mature continuous batching dominate at
+high concurrency. FA3 v2 closed ~60% of the overall gap.
+
+## Phase 5c (2026-03-31) -- Double-buffered scratch + alloc_zeros elimination (H100 SXM 80GB)
+
+Double-buffered scratch in forward_gpu_only (graph-captured path): eliminates 54 per-layer
+alloc+D2D copies per step, replaced with 1 copy at end. Changed alloc_zeros to unsafe alloc
+in 16 locations (scratch init, linear, activation, norm, softmax, fused_ops).
+
+### Qwen2.5-7B f16 -- rvLLM vs vLLM 0.18 (512 tok/req, same H100)
+
+| N | rvLLM | vLLM 0.18 (eager) | ratio | vs 5b |
+|---|---|---|---|---|
+| 1 | 53 | -- | -- | -- |
+| 16 | 878 | 1,714 | vLLM 1.95x | +1.7% |
+| 32 | 1,711 | 3,431 | vLLM 2.01x | +2.5% |
+| 64 | 3,006 | 6,677 | vLLM 2.22x | -5.8% |
+| 128 | 5,499 | 12,230 | vLLM 2.22x | +7.0% |
+
+Modest +7% at N=128 from graph overhead reduction. The ~2x gap is GEMM-bound:
+vLLM's FlashAttention v3 + Triton GEMM autotuning + mature continuous batching
+dominate. The per-layer allocation/D2D overhead was <1% of total step time.
+
 ## Phase 5b (2026-03-31) -- cublasLt build fix + vLLM comparison (H100 SXM 80GB)
 
 Binary built with `--features cuda,cublaslt`. Fixed cublaslt_raw module registration,

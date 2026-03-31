@@ -95,8 +95,8 @@ impl CudaLinearLayer {
                 .clone_htod(&tiled)
                 .map_err(|e| LLMError::GpuError(format!("tiled bias htod failed: {e}")))?
         } else {
-            stream
-                .alloc_zeros::<f32>(m * n)
+            // Safety: sgemm with beta=0 writes all m*n elements
+            unsafe { stream.alloc::<f32>(m * n) }
                 .map_err(|e| LLMError::GpuError(format!("output alloc failed: {e}")))?
         };
 
@@ -150,9 +150,8 @@ impl CudaLinearLayer {
         // Cast input f32 -> f16
         let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, &cast_f32_f16)?;
 
-        // Allocate f16 output
-        let mut output_f16 = stream
-            .alloc_zeros::<f16>(m * n)
+        // Safety: hgemm with beta=0 writes all m*n elements
+        let mut output_f16 = unsafe { stream.alloc::<f16>(m * n) }
             .map_err(|e| LLMError::GpuError(format!("forward_once_f16 alloc: {e}")))?;
 
         // hgemm: output = input @ weight^T
@@ -190,9 +189,8 @@ impl CudaLinearLayer {
             .map_err(|e| LLMError::GpuError(format!("load cast_f32_to_f16_kernel: {e}")))?;
         let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, &cast_f32_f16)?;
 
-        // Alloc f32 output directly (no f16 intermediate + cast)
-        let mut output = stream
-            .alloc_zeros::<f32>(m * n)
+        // Safety: hgemm_f32_output with beta=0 writes all m*n elements
+        let mut output = unsafe { stream.alloc::<f32>(m * n) }
             .map_err(|e| LLMError::GpuError(format!("forward_mixed alloc: {e}")))?;
 
         // f16 x f16 -> f32 via cublasGemmEx
@@ -213,8 +211,8 @@ impl CudaLinearLayer {
         k: usize,
         blas: &CublasHandle,
     ) -> Result<CudaSlice<f32>> {
-        let mut output = blas.stream()
-            .alloc_zeros::<f32>(m * n)
+        // Safety: hgemm with beta=0 writes all m*n elements
+        let mut output = unsafe { blas.stream().alloc::<f32>(m * n) }
             .map_err(|e| LLMError::GpuError(format!("forward_f16_in alloc: {e}")))?;
         blas.hgemm_f32_output(m, n, k, 1.0, input_f16, weight, 0.0, &mut output)?;
         Ok(output)
@@ -251,8 +249,8 @@ impl CudaLinearLayer {
 
         let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, &cast_f32_f16)?;
 
-        let mut output_f16 = stream
-            .alloc_zeros::<f16>(m * n)
+        // Safety: hgemm with beta=0 writes all m*n elements
+        let mut output_f16 = unsafe { stream.alloc::<f16>(m * n) }
             .map_err(|e| LLMError::GpuError(format!("forward_once_f16_lt alloc: {e}")))?;
 
         lt.hgemm_a_bt(m, n, k, 1.0, &input_f16, weight, 0.0, &mut output_f16)?;
@@ -266,8 +264,8 @@ impl CudaLinearLayer {
         n: usize,
         kernel: &CudaFunction,
     ) -> Result<CudaSlice<f16>> {
-        let mut output = stream
-            .alloc_zeros::<f16>(n)
+        // Safety: cast kernel writes all n elements
+        let mut output = unsafe { stream.alloc::<f16>(n) }
             .map_err(|e| LLMError::GpuError(format!("cast_f32_to_f16 alloc: {e}")))?;
 
         let threads = 256u32;
@@ -296,8 +294,8 @@ impl CudaLinearLayer {
         n: usize,
         kernel: &CudaFunction,
     ) -> Result<CudaSlice<f32>> {
-        let mut output = stream
-            .alloc_zeros::<f32>(n)
+        // Safety: cast kernel writes all n elements
+        let mut output = unsafe { stream.alloc::<f32>(n) }
             .map_err(|e| LLMError::GpuError(format!("cast_f16_to_f32 alloc: {e}")))?;
 
         let threads = 256u32;

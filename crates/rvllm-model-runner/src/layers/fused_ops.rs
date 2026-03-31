@@ -41,11 +41,10 @@ mod inner {
     ) -> Result<(CudaSlice<f32>, CudaSlice<f32>)> {
         let n = num_tokens * hidden_size;
 
-        let output = stream
-            .alloc_zeros::<f32>(n)
+        // Safety: kernel writes all n elements to both output and residual
+        let output = unsafe { stream.alloc::<f32>(n) }
             .map_err(|e| LLMError::GpuError(format!("fused_res_rmsnorm output alloc: {e}")))?;
-        let residual = stream
-            .alloc_zeros::<f32>(n)
+        let residual = unsafe { stream.alloc::<f32>(n) }
             .map_err(|e| LLMError::GpuError(format!("fused_res_rmsnorm residual alloc: {e}")))?;
 
         let block_dim = hidden_size.min(1024) as u32;
@@ -92,8 +91,8 @@ mod inner {
         let num_tokens = token_ids.len();
         let output_len = num_tokens * hidden_size;
 
-        let output = stream
-            .alloc_zeros::<f32>(output_len)
+        // Safety: embedding gather kernel writes all output_len elements
+        let output = unsafe { stream.alloc::<f32>(output_len) }
             .map_err(|e| LLMError::GpuError(format!("embed_gather output alloc: {e}")))?;
 
         // Upload token IDs (small transfer, typically < 4KB even for batch=1024)
@@ -173,8 +172,8 @@ mod inner {
         b: &CudaSlice<f32>,
         n: usize,
     ) -> Result<CudaSlice<f32>> {
-        let output = stream
-            .alloc_zeros::<f32>(n)
+        // Safety: add kernel writes all n elements
+        let output = unsafe { stream.alloc::<f32>(n) }
             .map_err(|e| LLMError::GpuError(format!("add_tensors alloc: {e}")))?;
 
         let threads = 256u32;
