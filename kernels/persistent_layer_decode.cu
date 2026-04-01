@@ -21,6 +21,7 @@
 //   5: Add + RMSNorm + GateUp GEMV
 //   6: SiLU + Down GEMV
 
+#include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <float.h>
 
