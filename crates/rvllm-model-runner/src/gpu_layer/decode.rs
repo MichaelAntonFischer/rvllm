@@ -639,15 +639,18 @@ impl GpuTransformerLayer {
             &p_sync_flags     as *const u64 as *mut c_void,  // sync_flags
         ];
 
-        // Grid of 256 blocks -- all must fit simultaneously on the GPU
-        // (H100 SXM has 132 SMs x 2 blocks/SM = 264 capacity at this smem size)
+        // Regular launch (not cooperative). Grid of 256 blocks fits on H100
+        // (132 SMs x 8 blocks/SM = 1056 capacity). Atomic sync guarantees
+        // correctness as long as all blocks are co-resident.
         unsafe {
-            self.loader.launch_cooperative_cubin(
+            self.loader.launch_cubin_raw(
                 "persistent_layer_decode",
                 "persistent_layer_decode_f16",
-                (256, 1, 1),
-                (256, 1, 1), // PLD_THREADS
-                smem,
+                LaunchConfig {
+                    grid_dim: (256, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem,
+                },
                 &mut args,
             )?;
         }
