@@ -11,15 +11,6 @@ pub mod cpu_buffer;
 pub mod cublas;
 #[cfg(feature = "cuda")]
 pub mod cublas_ops;
-<<<<<<< Updated upstream
-#[cfg(feature = "cublaslt")]
-pub mod cublas_autotune;
-#[cfg(feature = "cublaslt")]
-pub mod cublaslt_ops;
-#[cfg(feature = "cublaslt")]
-pub mod cublaslt_raw;
-=======
->>>>>>> Stashed changes
 #[cfg(feature = "cuda")]
 pub mod cuda_allocator;
 pub mod cuda_graph;

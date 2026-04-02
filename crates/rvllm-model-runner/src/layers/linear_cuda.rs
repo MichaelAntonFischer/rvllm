@@ -93,13 +93,8 @@ impl CudaLinearLayer {
                 .htod_sync_copy(&tiled)
                 .map_err(|e| LLMError::GpuError(format!("tiled bias htod failed: {e}")))?
         } else {
-<<<<<<< Updated upstream
-            // Safety: sgemm with beta=0 writes all m*n elements
-            unsafe { stream.alloc::<f32>(m * n) }
-=======
             device
                 .alloc_zeros::<f32>(m * n)
->>>>>>> Stashed changes
                 .map_err(|e| LLMError::GpuError(format!("output alloc failed: {e}")))?
         };
 
@@ -213,39 +208,79 @@ impl CudaLinearLayer {
             }
         }
 
-        // Warp-per-row kernel: 8 warps per block, each warp computes one output row.
-        // Uses branchless FP8→f32 (24 insn/elem). This is FASTER than hardware CVT
-        // (3 insn/elem) on DIGITS: the ALU work throttles memory request rate, keeping
-        // power under the firmware cap so clocks sustain 851 MHz. Native CVT triggers
-        // a drop to 507 MHz after ~3s — even with nvidia-smi -lgc, firmware overrides.
+        // Adaptive kernel dispatch based on matrix size:
+        //
+        // N ≤ 8192: WPR+native (hardware FP8 CVT, 3 insn/elem)
+        //   - Small weight matrices fit in L2 cache across the 8 warps' rows
+        //   - Minimum instruction count maximizes L2 hit rate
+        //   - Benchmarked: up to 691 GB/s (2.5x DRAM peak!) on OProj (22 MB)
+        //
+        // N > 8192: Multirow (4 rows/block, LUT-based FP8 CVT)
+        //   - Large matrices are DRAM-bound; multirow amortizes input reads
+        //   - LUT avoids shared-memory pressure from native CVT
+        //   - Benchmarked: 256 GB/s on GateUp (136 MB) = 94% of DRAM peak
+        //
+        // NOTE: Previous WPR+ALU kernel was intentionally slow (24 insn/elem) to
+        // throttle memory requests and stay under a firmware power cap bug. That bug
+        // is fixed (power brick re-seat), so we now use the faster variants.
         let threads = 256u32;
-        let wpr_rows = 8u32;
-        let cfg = LaunchConfig {
-            grid_dim: (((n as u32) + wpr_rows - 1) / wpr_rows, m as u32, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let num_col_blocks = (k + 127) / 128;
 
         if let Some(scale_ptr) = scale {
             if scale_ptr.len() > 1 {
-                // Block-wise scale
-                let num_col_blocks = (k + 127) / 128;
-                let kernel = device
-                    .get_func("fp8_gemv", "fp8_gemv_blockwise_wpr_kernel")
-                    .ok_or_else(|| LLMError::GpuError("fp8_gemv_blockwise_wpr_kernel not loaded".into()))?;
-                unsafe {
-                    kernel
-                        .launch(cfg, (
-                            &mut output,
-                            weight_fp8,
-                            scale_ptr,
-                            input,
-                            m as i32,
-                            n as i32,
-                            k as i32,
-                            num_col_blocks as i32,
-                        ))
-                        .map_err(|e| LLMError::GpuError(format!("fp8_gemv_wpr launch: {e}")))?;
+                // Block-wise scale: choose kernel based on N
+                if n <= 8192 {
+                    // WPR + native CVT: best for small N (L2 reuse)
+                    let wpr_rows = 8u32;
+                    let cfg = LaunchConfig {
+                        grid_dim: (((n as u32) + wpr_rows - 1) / wpr_rows, m as u32, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let kernel = device
+                        .get_func("fp8_gemv", "fp8_gemv_blockwise_wpr_native_kernel")
+                        .or_else(|| device.get_func("fp8_gemv", "fp8_gemv_blockwise_wpr_kernel"))
+                        .ok_or_else(|| LLMError::GpuError("no fp8_gemv wpr kernel loaded".into()))?;
+                    unsafe {
+                        kernel
+                            .launch(cfg, (
+                                &mut output,
+                                weight_fp8,
+                                scale_ptr,
+                                input,
+                                m as i32,
+                                n as i32,
+                                k as i32,
+                                num_col_blocks as i32,
+                            ))
+                            .map_err(|e| LLMError::GpuError(format!("fp8_gemv_wpr_native launch: {e}")))?;
+                    }
+                } else {
+                    // Multirow: best for large N (DRAM bandwidth saturation)
+                    let rows_per_block = 4u32;
+                    let cfg = LaunchConfig {
+                        grid_dim: (((n as u32) + rows_per_block - 1) / rows_per_block, m as u32, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 256 * 4, // FP8 LUT
+                    };
+                    let kernel = device
+                        .get_func("fp8_gemv", "fp8_gemv_blockwise_multirow_kernel")
+                        .or_else(|| device.get_func("fp8_gemv", "fp8_gemv_blockwise_wpr_kernel"))
+                        .ok_or_else(|| LLMError::GpuError("no fp8_gemv multirow/wpr kernel loaded".into()))?;
+                    unsafe {
+                        kernel
+                            .launch(cfg, (
+                                &mut output,
+                                weight_fp8,
+                                scale_ptr,
+                                input,
+                                m as i32,
+                                n as i32,
+                                k as i32,
+                                num_col_blocks as i32,
+                            ))
+                            .map_err(|e| LLMError::GpuError(format!("fp8_gemv_multirow launch: {e}")))?;
+                    }
                 }
             } else {
                 // Per-tensor scale
@@ -328,27 +363,50 @@ impl CudaLinearLayer {
             }
         }
 
-        // Warp-per-row kernel (see comment above for power/clock rationale).
+        // Adaptive kernel dispatch (see gpu_fp8_gemv for full rationale).
         let threads = 256u32;
-        let wpr_rows = 8u32;
-        let cfg = LaunchConfig {
-            grid_dim: (((n as u32) + wpr_rows - 1) / wpr_rows, m as u32, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let num_col_blocks = (k + 127) / 128;
 
         if let Some(scale_ptr) = weight_scale {
             if scale_ptr.len() > 1 {
-                let num_col_blocks = (k + 127) / 128;
-                let kernel = device
-                    .get_func("fp8_gemv", "fp8_gemv_blockwise_wpr_kernel")
-                    .ok_or_else(|| LLMError::GpuError("fp8_gemv_blockwise_wpr_kernel not loaded".into()))?;
-                unsafe {
-                    kernel.launch(cfg, (
-                        output as &mut CudaSlice<f32>,
-                        weight_fp8, scale_ptr, input,
-                        m as i32, n as i32, k as i32, num_col_blocks as i32,
-                    )).map_err(|e| LLMError::GpuError(format!("fp8_gemv_wpr_into blockwise: {e}")))?;
+                if n <= 8192 {
+                    // WPR + native CVT: best for small N (L2 reuse)
+                    let wpr_rows = 8u32;
+                    let cfg = LaunchConfig {
+                        grid_dim: (((n as u32) + wpr_rows - 1) / wpr_rows, m as u32, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let kernel = device
+                        .get_func("fp8_gemv", "fp8_gemv_blockwise_wpr_native_kernel")
+                        .or_else(|| device.get_func("fp8_gemv", "fp8_gemv_blockwise_wpr_kernel"))
+                        .ok_or_else(|| LLMError::GpuError("no fp8_gemv wpr kernel loaded".into()))?;
+                    unsafe {
+                        kernel.launch(cfg, (
+                            output as &mut CudaSlice<f32>,
+                            weight_fp8, scale_ptr, input,
+                            m as i32, n as i32, k as i32, num_col_blocks as i32,
+                        )).map_err(|e| LLMError::GpuError(format!("fp8_gemv_wpr_native_into: {e}")))?;
+                    }
+                } else {
+                    // Multirow: best for large N (DRAM bandwidth saturation)
+                    let rows_per_block = 4u32;
+                    let cfg = LaunchConfig {
+                        grid_dim: (((n as u32) + rows_per_block - 1) / rows_per_block, m as u32, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 256 * 4,
+                    };
+                    let kernel = device
+                        .get_func("fp8_gemv", "fp8_gemv_blockwise_multirow_kernel")
+                        .or_else(|| device.get_func("fp8_gemv", "fp8_gemv_blockwise_wpr_kernel"))
+                        .ok_or_else(|| LLMError::GpuError("no fp8_gemv multirow/wpr kernel loaded".into()))?;
+                    unsafe {
+                        kernel.launch(cfg, (
+                            output as &mut CudaSlice<f32>,
+                            weight_fp8, scale_ptr, input,
+                            m as i32, n as i32, k as i32, num_col_blocks as i32,
+                        )).map_err(|e| LLMError::GpuError(format!("fp8_gemv_multirow_into: {e}")))?;
+                    }
                 }
             } else {
                 let kernel = device
@@ -738,14 +796,9 @@ impl CudaLinearLayer {
         // Cast input f32 -> f16
         let input_f16 = Self::gpu_cast_f32_to_f16(device, input, m * k)?;
 
-<<<<<<< Updated upstream
-        // Safety: hgemm with beta=0 writes all m*n elements
-        let mut output_f16 = unsafe { stream.alloc::<f16>(m * n) }
-=======
         // Allocate f16 output
         let mut output_f16 = device
             .alloc_zeros::<f16>(m * n)
->>>>>>> Stashed changes
             .map_err(|e| LLMError::GpuError(format!("forward_once_f16 alloc: {e}")))?;
 
         // hgemm: output = input @ weight^T
@@ -762,113 +815,13 @@ impl CudaLinearLayer {
         Self::gpu_cast_f16_to_f32(device, &output_f16, m * n)
     }
 
-<<<<<<< Updated upstream
-    /// Mixed-precision forward: f32 input, f16 weight, f32 output.
-    ///
-    /// Casts input f32->f16, then uses cublasGemmEx(f16,f16->f32) to produce
-    /// f32 output directly. Saves 1 cast kernel + 1 alloc per call vs the old
-    /// forward_once_f16 which does cast_in + hgemm + cast_out (2 casts + 2 allocs).
-    pub fn forward_mixed(
-        input: &CudaSlice<f32>,
-        weight: &CudaSlice<f16>,
-        m: usize,
-        n: usize,
-        k: usize,
-        blas: &CublasHandle,
-        loader: &rvllm_gpu::kernel_loader::KernelLoader,
-    ) -> Result<CudaSlice<f32>> {
-        let stream = blas.stream();
-
-        // Cast input f32 -> f16 (still needed; cuBLAS requires matching A/B types)
-        let cast_f32_f16 = loader.get_func("cast_fp", "cast_f32_to_f16_kernel")
-            .map_err(|e| LLMError::GpuError(format!("load cast_f32_to_f16_kernel: {e}")))?;
-        let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, &cast_f32_f16)?;
-
-        // Safety: hgemm_f32_output with beta=0 writes all m*n elements
-        let mut output = unsafe { stream.alloc::<f32>(m * n) }
-            .map_err(|e| LLMError::GpuError(format!("forward_mixed alloc: {e}")))?;
-
-        // f16 x f16 -> f32 via cublasGemmEx
-        blas.hgemm_f32_output(m, n, k, 1.0, &input_f16, weight, 0.0, &mut output)?;
-        Ok(output)
-    }
-
-    /// Pre-cast forward: f16 input already cast by caller, f16 weight, f32 output.
-    ///
-    /// When multiple linears share the same f32 input (e.g. Q/K/V all use normed,
-    /// gate/up both use normed2), the caller casts f32->f16 ONCE and calls this
-    /// for each projection. Saves N-1 redundant cast kernels.
-    pub fn forward_f16_in(
-        input_f16: &CudaSlice<f16>,
-        weight: &CudaSlice<f16>,
-        m: usize,
-        n: usize,
-        k: usize,
-        blas: &CublasHandle,
-    ) -> Result<CudaSlice<f32>> {
-        // Safety: hgemm with beta=0 writes all m*n elements
-        let mut output = unsafe { blas.stream().alloc::<f32>(m * n) }
-            .map_err(|e| LLMError::GpuError(format!("forward_f16_in alloc: {e}")))?;
-        blas.hgemm_f32_output(m, n, k, 1.0, input_f16, weight, 0.0, &mut output)?;
-        Ok(output)
-    }
-
-    /// Static forward with f16 weights using cublasLt for decode-sized batches.
-    ///
-    /// When `cublaslt` feature is enabled and `m <= CUBLASLT_M_THRESHOLD`,
-    /// uses cublasLt's heuristic algo selection (with workspace + split-K)
-    /// for better decode performance. Falls back to standard cuBLAS hgemm
-    /// for larger batches.
-    #[cfg(feature = "cublaslt")]
-    pub fn forward_once_f16_lt(
-        input: &CudaSlice<f32>,
-        weight: &CudaSlice<f16>,
-        m: usize,
-        n: usize,
-        k: usize,
-        blas: &CublasHandle,
-        lt: &CublasLtOps,
-        loader: &rvllm_gpu::kernel_loader::KernelLoader,
-    ) -> Result<CudaSlice<f32>> {
-        // For large M (prefill), standard cuBLAS is fine -- less overhead.
-        if m > CUBLASLT_M_THRESHOLD {
-            return Self::forward_once_f16(input, weight, m, n, k, blas, loader);
-        }
-
-        let stream = blas.stream();
-
-        let cast_f32_f16 = loader.get_func("cast_fp", "cast_f32_to_f16_kernel")
-            .map_err(|e| LLMError::GpuError(format!("load cast_f32_to_f16_kernel: {e}")))?;
-        let cast_f16_f32 = loader.get_func("cast_fp", "cast_f16_to_f32_kernel")
-            .map_err(|e| LLMError::GpuError(format!("load cast_f16_to_f32_kernel: {e}")))?;
-
-        let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, &cast_f32_f16)?;
-
-        // Safety: hgemm with beta=0 writes all m*n elements
-        let mut output_f16 = unsafe { stream.alloc::<f16>(m * n) }
-            .map_err(|e| LLMError::GpuError(format!("forward_once_f16_lt alloc: {e}")))?;
-
-        lt.hgemm_a_bt(m, n, k, 1.0, &input_f16, weight, 0.0, &mut output_f16)?;
-
-        Self::gpu_cast_f16_to_f32(stream, &output_f16, m * n, &cast_f16_f32)
-    }
-
-    pub fn gpu_cast_f32_to_f16(
-        stream: &Arc<CudaStream>,
-=======
     fn gpu_cast_f32_to_f16(
         device: &Arc<CudaDevice>,
->>>>>>> Stashed changes
         input: &CudaSlice<f32>,
         n: usize,
     ) -> Result<CudaSlice<f16>> {
-<<<<<<< Updated upstream
-        // Safety: cast kernel writes all n elements
-        let mut output = unsafe { stream.alloc::<f16>(n) }
-=======
         let mut output = device
             .alloc_zeros::<f16>(n)
->>>>>>> Stashed changes
             .map_err(|e| LLMError::GpuError(format!("cast_f32_to_f16 alloc: {e}")))?;
 
         let kernel = device
@@ -896,13 +849,8 @@ impl CudaLinearLayer {
         input: &CudaSlice<f16>,
         n: usize,
     ) -> Result<CudaSlice<f32>> {
-<<<<<<< Updated upstream
-        // Safety: cast kernel writes all n elements
-        let mut output = unsafe { stream.alloc::<f32>(n) }
-=======
         let mut output = device
             .alloc_zeros::<f32>(n)
->>>>>>> Stashed changes
             .map_err(|e| LLMError::GpuError(format!("cast_f16_to_f32 alloc: {e}")))?;
 
         let kernel = device

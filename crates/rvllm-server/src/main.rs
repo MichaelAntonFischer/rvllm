@@ -48,19 +48,11 @@ enum Commands {
     Benchmark {
         #[arg(long)]
         model: String,
-<<<<<<< Updated upstream
-        /// Comma-separated batch sizes to sweep, e.g. "1,2,4,8,16,32,64,128"
-        #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
-        n: String,
-        /// Tokens to generate per request
-        #[arg(long, default_value_t = 512)]
-=======
         #[arg(long, default_value_t = 100)]
         num_prompts: usize,
         #[arg(long, default_value_t = 128)]
         input_len: usize,
         #[arg(long, default_value_t = 128)]
->>>>>>> Stashed changes
         output_len: usize,
     },
 }

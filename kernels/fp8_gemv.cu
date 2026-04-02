@@ -521,6 +521,133 @@ __global__ void fp8_gemv_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-row FP8 GEMV: one block computes 4 output rows simultaneously.
+//
+// Key advantage: the input vector x[K] is loaded once and reused across all
+// 4 rows. For small N (< 8K), weight rows may partially fit in L2 cache,
+// giving superlinear bandwidth (up to 540 GB/s on 273 GB/s DRAM).
+//
+// For large N (> 8K), multirow still wins over single-row kernels by ~4%
+// because it reduces total grid blocks (fewer scheduler overhead) and
+// amortizes the shared-memory LUT build across 4 output rows.
+//
+// Launch config:
+//   Grid:  (ceil(N/4), M, 1)
+//   Block: (256, 1, 1)
+//   Shared: 256*4 (LUT) + 8*4 (warp_sums) = 1056 bytes
+// ---------------------------------------------------------------------------
+#define MULTIROW_ROWS 4
+
+extern "C"
+__global__ void fp8_gemv_blockwise_multirow_kernel(
+    float* __restrict__ output,
+    const unsigned char* __restrict__ weight,
+    const float* __restrict__ scale,
+    const float* __restrict__ input,
+    int M, int N, int K,
+    int num_col_blocks
+) {
+    int n_base = blockIdx.x * MULTIROW_ROWS;
+    int m = blockIdx.y;
+    if (m >= M) return;
+
+    const int BLOCK_DIM = 256;
+
+    __shared__ float fp8_lut[256];
+    fp8_lut[threadIdx.x] = fp8e4m3_to_float((unsigned char)threadIdx.x);
+    __syncthreads();
+
+    const float* x_row = input + (long long)m * K;
+
+    float acc[MULTIROW_ROWS];
+    #pragma unroll
+    for (int r = 0; r < MULTIROW_ROWS; r++) acc[r] = 0.0f;
+
+    for (int k = threadIdx.x * 8; k + 7 < K; k += BLOCK_DIM * 8) {
+        // Load input once, reuse across all rows
+        float x0 = __ldg(x_row + k);
+        float x1 = __ldg(x_row + k + 1);
+        float x2 = __ldg(x_row + k + 2);
+        float x3 = __ldg(x_row + k + 3);
+        float x4 = __ldg(x_row + k + 4);
+        float x5 = __ldg(x_row + k + 5);
+        float x6 = __ldg(x_row + k + 6);
+        float x7 = __ldg(x_row + k + 7);
+
+        #pragma unroll
+        for (int r = 0; r < MULTIROW_ROWS; r++) {
+            int n = n_base + r;
+            if (n >= N) break;
+
+            const unsigned char* w_row = weight + (long long)n * K;
+            int scale_row = n >> 7;
+
+            unsigned int lo4 = __ldg(reinterpret_cast<const unsigned int*>(w_row + k));
+            unsigned int hi4 = __ldg(reinterpret_cast<const unsigned int*>(w_row + k + 4));
+
+            int sc0 = k >> 7;
+            float s0 = __ldg(&scale[scale_row * num_col_blocks + sc0]);
+            int sc4 = (k + 4) >> 7;
+            float s4 = (sc4 != sc0) ? __ldg(&scale[scale_row * num_col_blocks + sc4]) : s0;
+
+            acc[r] += fp8_lut[lo4 & 0xFFu]         * s0 * x0;
+            acc[r] += fp8_lut[(lo4 >> 8) & 0xFFu]  * s0 * x1;
+            acc[r] += fp8_lut[(lo4 >> 16) & 0xFFu] * s0 * x2;
+            acc[r] += fp8_lut[(lo4 >> 24) & 0xFFu] * s0 * x3;
+            acc[r] += fp8_lut[hi4 & 0xFFu]         * s4 * x4;
+            acc[r] += fp8_lut[(hi4 >> 8) & 0xFFu]  * s4 * x5;
+            acc[r] += fp8_lut[(hi4 >> 16) & 0xFFu] * s4 * x6;
+            acc[r] += fp8_lut[(hi4 >> 24) & 0xFFu] * s4 * x7;
+        }
+    }
+
+    // Remainder
+    {
+        int aligned_k = (K / 8) * 8;
+        for (int kr = aligned_k + threadIdx.x; kr < K; kr += BLOCK_DIM) {
+            float xv = __ldg(x_row + kr);
+            #pragma unroll
+            for (int r = 0; r < MULTIROW_ROWS; r++) {
+                int n = n_base + r;
+                if (n >= N) break;
+                const unsigned char* w_row = weight + (long long)n * K;
+                int sc = kr >> 7;
+                float s = __ldg(&scale[(n >> 7) * num_col_blocks + sc]);
+                acc[r] += fp8_lut[__ldg(w_row + kr)] * s * xv;
+            }
+        }
+    }
+
+    // Reduce and write each row
+    __shared__ float warp_sums[BLOCK_DIM / 32];
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+
+    #pragma unroll
+    for (int r = 0; r < MULTIROW_ROWS; r++) {
+        int n = n_base + r;
+        if (n >= N) break;
+
+        float a = acc[r];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            a += __shfl_down_sync(0xffffffff, a, offset);
+
+        if (lane == 0) warp_sums[warp] = a;
+        __syncthreads();
+
+        if (warp == 0) {
+            a = (lane < (BLOCK_DIM / 32)) ? warp_sums[lane] : 0.0f;
+            #pragma unroll
+            for (int offset = (BLOCK_DIM / 64); offset > 0; offset >>= 1)
+                a += __shfl_down_sync(0xffffffff, a, offset);
+            if (lane == 0) output[(long long)m * N + n] = a;
+        }
+        __syncthreads();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Warp-per-row FP8 GEMV: each warp independently computes one output element.
 //
 // Key insight: The standard kernel assigns 256 threads to ONE output row,

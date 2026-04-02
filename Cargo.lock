@@ -634,7 +634,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38cd60a9a42ec83a2ed7effb0b1f073270264ea99da7acfc44f7e8d74dee0384"
 dependencies = [
  "half",
- "libloading 0.9.0",
+ "libloading",
 ]
 
 [[package]]
@@ -1573,19 +1573,6 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 [[package]]
 name = "libloading"
 version = "0.8.9"
-<<<<<<< Updated upstream
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
-dependencies = [
- "cfg-if",
- "windows-link",
-]
-
-[[package]]
-name = "libloading"
-version = "0.9.0"
-=======
->>>>>>> Stashed changes
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
 dependencies = [
@@ -2786,7 +2773,6 @@ dependencies = [
  "bytemuck",
  "cudarc",
  "half",
- "libloading 0.8.9",
  "parking_lot",
  "rvllm-core",
  "thiserror 2.0.18",
@@ -2975,7 +2961,6 @@ name = "rvllm-tokenizer"
 version = "0.1.0"
 dependencies = [
  "hf-hub",
- "openssl",
  "rvllm-core",
  "serde",
  "serde_json",

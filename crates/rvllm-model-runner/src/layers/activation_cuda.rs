@@ -60,14 +60,9 @@ mod inner {
             stream: &CudaStream,
         ) -> Result<CudaSlice<f32>> {
             let n = input.len();
-<<<<<<< Updated upstream
-            // Safety: SiLU kernel writes all n elements
-            let mut output = unsafe { stream.alloc::<f32>(n) }
-=======
             let output = self
                 .device
                 .alloc_zeros::<f32>(n)
->>>>>>> Stashed changes
                 .map_err(|e| LLMError::GpuError(format!("SiLU alloc failed: {e}")))?;
             let cfg = launch_cfg(n as u32);
             // SAFETY: kernel reads `n` f32 from `input`, writes `n` f32 to `output`.
@@ -141,14 +136,9 @@ mod inner {
             stream: &CudaStream,
         ) -> Result<CudaSlice<f32>> {
             let n = input.len();
-<<<<<<< Updated upstream
-            // Safety: GELU kernel writes all n elements
-            let mut output = unsafe { stream.alloc::<f32>(n) }
-=======
             let output = self
                 .device
                 .alloc_zeros::<f32>(n)
->>>>>>> Stashed changes
                 .map_err(|e| LLMError::GpuError(format!("GELU alloc failed: {e}")))?;
             let cfg = launch_cfg(n as u32);
             // SAFETY: kernel reads `n` f32 from `input`, writes `n` f32 to `output`.
@@ -235,14 +225,9 @@ mod inner {
                     up.len()
                 )));
             }
-<<<<<<< Updated upstream
-            // Safety: fused_silu_mul kernel writes all n elements
-            let mut output = unsafe { stream.alloc::<f32>(n) }
-=======
             let output = self
                 .device
                 .alloc_zeros::<f32>(n)
->>>>>>> Stashed changes
                 .map_err(|e| LLMError::GpuError(format!("fused_silu_mul alloc failed: {e}")))?;
             let cfg = launch_cfg(n as u32);
             // SAFETY: kernel reads `n` elements each from `gate` and `up`, writes `n`

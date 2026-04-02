@@ -134,56 +134,6 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
             };
             let ptx_path = ptx_dir.join(&ptx_name);
 
-<<<<<<< Updated upstream
-            // Cooperative-groups kernels need cubin (not PTX) to preserve
-            // grid-level sync. PTX compilation downgrades grid.sync() to
-            // block-level bar.sync which silently breaks the kernel.
-            let needs_cubin = stem == "persistent_layer_decode" || stem == "megakernel_decode";
-            let arch_flag = format!("-arch={}", arch);
-
-            if needs_cubin {
-                // Compile to cubin for cooperative launch
-                let cubin_name = if archs.len() == 1 {
-                    format!("{}.cubin", stem)
-                } else {
-                    format!("{}_{}.cubin", stem, arch)
-                };
-                let cubin_path = ptx_dir.join(&cubin_name);
-                let mut nvcc_cmd = Command::new(nvcc);
-                nvcc_cmd.args(["-cubin", &arch_flag, "-O3", "--use_fast_math"]);
-                nvcc_cmd.arg("-Xptxas");
-                nvcc_cmd.arg("-v");
-                nvcc_cmd.arg("-o").arg(&cubin_path).arg(&path);
-                let output = nvcc_cmd.output();
-                match output {
-                    Ok(o) if o.status.success() => {
-                        println!(
-                            "cargo:warning=Compiled kernel: {}.cu -> {} (cubin, {})",
-                            stem, cubin_name, arch
-                        );
-                        // Surface register usage / spill stats from nvcc -Xptxas -v
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        for line in stderr.lines() {
-                            println!("cargo:warning=[ptxas] {}", line);
-                        }
-                    }
-                    Ok(o) => {
-                        println!(
-                            "cargo:warning=nvcc cubin failed for {}.cu [{}] (exit {}), skipping",
-                            stem, arch, o.status.code().unwrap_or(-1)
-                        );
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        for line in stderr.lines() {
-                            println!("cargo:warning=[nvcc stderr] {}", line);
-                        }
-                    }
-                    Err(e) => {
-                        println!(
-                            "cargo:warning=Failed to run nvcc for {}.cu [{}]: {}, skipping",
-                            stem, arch, e
-                        );
-                    }
-=======
             let status = Command::new(nvcc)
                 .args(["-ptx", &format!("-arch={}", arch), "-O3", "-o"])
                 .arg(&ptx_path)
@@ -196,73 +146,24 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
                         "cargo:warning=Compiled kernel: {}.cu -> {} ({})",
                         stem, ptx_name, arch
                     );
->>>>>>> Stashed changes
                 }
-            } else {
-                let mut nvcc_cmd = Command::new(nvcc);
-                nvcc_cmd.args(["-ptx", &arch_flag, "-O3"]);
-                nvcc_cmd.arg("-o").arg(&ptx_path).arg(&path);
-                let status = nvcc_cmd.status();
-                match status {
-                    Ok(s) if s.success() => {
-                        println!(
-                            "cargo:warning=Compiled kernel: {}.cu -> {} ({})",
-                            stem, ptx_name, arch
-                        );
-                    }
-                    Ok(s) => {
-                        println!(
-                            "cargo:warning=nvcc failed for {}.cu [{}] (exit {}), skipping",
-                            stem, arch, s.code().unwrap_or(-1)
-                        );
-                    }
-                    Err(e) => {
-                        println!(
-                            "cargo:warning=Failed to run nvcc for {}.cu [{}]: {}, skipping",
-                            stem, arch, e
-                        );
-                    }
+                Ok(s) => {
+                    println!(
+                        "cargo:warning=nvcc failed for {}.cu [{}] (exit {}), skipping",
+                        stem, arch, s.code().unwrap_or(-1)
+                    );
+                }
+                Err(e) => {
+                    println!(
+                        "cargo:warning=Failed to run nvcc for {}.cu [{}]: {}, skipping",
+                        stem, arch, e
+                    );
                 }
             }
         }
     }
 
     println!("cargo:rustc-env=RVLLM_PTX_DIR={}", ptx_dir.display());
-<<<<<<< Updated upstream
-
-    // Also copy PTX files to workspace target/ptx/ where the runtime loader
-    // checks first (avoids hash-dependent build output paths).
-    let workspace_ptx = out_dir
-        .ancestors()
-        .find(|p| p.ends_with("target") || p.join("release").exists() || p.join("debug").exists())
-        .and_then(|p| {
-            // Walk up to target/
-            let mut cur = p;
-            while !cur.ends_with("target") {
-                cur = cur.parent()?;
-            }
-            Some(cur.to_path_buf())
-        })
-        .unwrap_or_else(|| out_dir.join("../../.."))
-        .join("ptx");
-
-    if let Err(e) = fs::create_dir_all(&workspace_ptx) {
-        println!("cargo:warning=Could not create {}: {e}", workspace_ptx.display());
-    } else {
-        if let Ok(entries) = fs::read_dir(&ptx_dir) {
-            for entry in entries.flatten() {
-                let src = entry.path();
-                if matches!(src.extension().and_then(|e| e.to_str()), Some("ptx") | Some("cubin")) {
-                    let dst = workspace_ptx.join(src.file_name().unwrap());
-                    if let Err(e) = fs::copy(&src, &dst) {
-                        println!("cargo:warning=Failed to copy {} -> {}: {e}", src.display(), dst.display());
-                    }
-                }
-            }
-        }
-    }
-=======
->>>>>>> Stashed changes
 }
 
 fn main() {
